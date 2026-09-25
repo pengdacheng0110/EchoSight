@@ -88,8 +88,19 @@ class MainActivity : AppCompatActivity() {
      */
     private val modelExecutor = Executors.newSingleThreadExecutor()
 
-    /** 提示音。ToneGenerator 在个别设备上构造会失败，所以整段包 runCatching。 */
-    private var tone: ToneGenerator? = null
+    /**
+     * 提示音。ToneGenerator 在个别设备上构造会失败，所以整段包 runCatching。
+     *
+     * 标 @Volatile：正常提示音在主线程播（[startListening]），
+     * 但 TTS 失败后的错误提示音是从 [ttsExecutor] 上播的 ——
+     * 那是唯一还能用的通道，网络一断每条播报都会走到那里。
+     * 两个线程同时读写这个引用，不加 @Volatile 就可能读到 null 而**静默不出声**，
+     * 正好把最后一条反馈通道也弄丢。
+     */
+    @Volatile private var tone: ToneGenerator? = null
+
+    /** 保护 [tone] 的惰性创建，避免两个线程各建一个（另一个永远漏着不释放）。 */
+    private val toneLock = Any()
 
     // ---------------- 播报状态 ----------------
 
@@ -190,13 +201,19 @@ class MainActivity : AppCompatActivity() {
 
         if (BuildConfig.SENSEAUDIO_KEY.isBlank()) {
             // 没有 Key 时语音链路整条不可用。而目标物品只能靠语音指定（见 switchTarget），
-            // 所以这不是"功能降级"，是应用根本用不起来 —— 必须把话说清楚，
-            // 并且别再让用户去按一个按了没反应的按钮。
+            // 所以这不是"功能降级"，是应用根本用不起来 —— 必须把话说清楚。
             voiceDisabled = true
             updateHud(getString(R.string.status_no_key),
                 getString(R.string.sub_no_key), UiState.ERROR)
-            pushButton.isEnabled = false
+            // 按钮**保持可点**，只把它压暗。原先这里是 isEnabled = false，
+            // 结果是点击事件根本不触发，盲人用户摸到按钮按下去一点声音都没有 ——
+            // 他不知道是应用坏了、还是自己没按到，只能反复按。
+            // 现在按下去会响一声"否"（见 bindButton），把"确实收到你的操作了，
+            // 但这事做不了"讲明白。视觉上仍然压暗，给看得见的人同样的信息。
             pushButton.alpha = 0.4f
+            // TTS 没 Key 也发不出去，启动时会是死一样的安静，
+            // 两声"否"是唯一能告诉用户"应用起来了、但用不了"的方式。
+            beepStartupFailure()
         }
         cleanStaleTtsFiles()
 
@@ -253,7 +270,11 @@ class MainActivity : AppCompatActivity() {
         bindButton()
         speak("回声视见已启动。请问你要寻找什么物品？" +
             "点一下屏幕下方的大按钮就可以说话，说完我会自己停下来。" +
-            "想让我做什么直接说就行，比如，找杯子，看看周围，或者，帮助。")
+            "想让我做什么直接说就行，比如，找杯子，看看周围，或者，帮助。",
+            // 启动问候语本身就是一次网络请求。网络不通时它静默失败，
+            // 应用会一声不响地打开 —— 用户以为没开起来，可能去按电源键、
+            // 反复点图标。两声"否"就是在说"我起来了，但我连不上网"。
+            onFail = { beepStartupFailure() })
     }
 
     // ---------------- 相机 ----------------
@@ -426,7 +447,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun bindButton() {
         pushButton.setOnClickListener {
-            if (voiceDisabled) return@setOnClickListener
+            if (voiceDisabled) {
+                // 没有 Key：说不了话，但**必须响一声**。
+                // 静默返回会让用户以为自己没按到，然后一直按。
+                pushButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                beepError()
+                return@setOnClickListener
+            }
             if (capture.isRecording) {
                 // 再点一下 = 我说完了。手动结束也走同一个回调，不会重复识别。
                 pushButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
@@ -506,7 +533,7 @@ class MainActivity : AppCompatActivity() {
         updateHud("正在识别，请稍等…", getString(R.string.sub_recognizing),
             UiState.SEARCHING, holdMs = 2500L)
         lifecycleScope.launch {
-            val text = withContext(Dispatchers.IO) { api.transcribe(wav) }
+            val result = withContext(Dispatchers.IO) { api.transcribe(wav) }
 
             // 退出确认态有时限：先说"我要退出"、过很久再随口说句带"确认"的话，
             // 不该把应用退掉。这里每次识别前先检查一次。
@@ -514,12 +541,28 @@ class MainActivity : AppCompatActivity() {
                 awaitingExit = false
             }
 
+            // 服务没答上来 —— 这不是用户说得不好，必须说清楚，否则他会
+            // 一遍遍提高音量重试，而真正该做的是去看网络。
+            if (result is VoiceApi.AsrResult.Failed) {
+                Log.w(TAG, "识别请求失败 code=${result.code}：${result.detail}")
+                updateHud(getString(R.string.status_asr_failed),
+                    getString(R.string.sub_asr_failed), UiState.ERROR, holdMs = 4000L)
+                // 先给一声错误提示音：这句话本身也要靠网络才能合成，
+                // 网络不通时它同样播不出来，那就只剩这一声了。
+                beepError()
+                speak("识别服务连不上，我没有听清你说什么。" +
+                    "这不是你说得不对，请检查手机的网络，然后再点一下按钮。")
+                return@launch
+            }
+
+            val text = (result as VoiceApi.AsrResult.Ok).text
             val cmd = Labels.parseCommand(text, awaitingExit)
             if (cmd == null) {
                 when {
                     // 确认态下听不懂就再问一次，绝不猜 —— 退出不可撤销。
                     awaitingExit ->
                         speak("我没有听清。要退出请说，确认退出；不退出请说，取消。")
+                    // 走到这里才是真的"服务答上来了，但没听出内容"。
                     text.isBlank() ->
                         speak("没有听清，请点一下按钮，靠近手机再说一次。")
                     else ->
@@ -784,11 +827,47 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 提示音。ToneGenerator 在个别设备上构造会失败，整段包住，失败就算了。 */
-    private fun beep(type: Int) {
+    private fun beep(type: Int, ms: Int = BEEP_MS) {
         runCatching {
-            val t = tone ?: ToneGenerator(AudioManager.STREAM_MUSIC, BEEP_VOLUME)
-                .also { tone = it }
-            t.startTone(type, BEEP_MS)
+            val t = synchronized(toneLock) {
+                tone ?: ToneGenerator(AudioManager.STREAM_MUSIC, BEEP_VOLUME).also { tone = it }
+            }
+            t.startTone(type, ms)
+        }
+    }
+
+    /**
+     * 出错了 —— 用一声"否"告诉用户，**不依赖网络**。
+     *
+     * 这是整个应用最后一条可靠通道。TTS 是网络请求，网络不通时
+     * "识别服务连不上"这句解释本身就播不出来；能说出口的只剩这一声。
+     *
+     * 带最小间隔：距离播报每 5 秒一次，断网时会连着失败，
+     * 不设限就变成报警器一样每隔几秒响一下。
+     */
+    @Volatile private var lastErrorBeepAt = 0L
+
+    private fun beepError() {
+        val now = System.currentTimeMillis()
+        if (now - lastErrorBeepAt < ERROR_BEEP_MIN_GAP_MS) return
+        lastErrorBeepAt = now
+        beep(TONE_ERROR, BEEP_ERROR_MS)
+    }
+
+    /**
+     * 启动时连不上网：连响两声"否"。
+     *
+     * 单声"否"和日常的错误音分不开。启动是特殊时刻 —— 用户刚点开应用，
+     * 最需要知道的恰恰是"它到底起来了没有"。而启动问候语本身就是一次 TTS 请求，
+     * 网络不通时它静默失败，应用会一声不响地打开：用户以为没开起来，
+     * 可能去按电源键、反复点图标。两声"否"就是在说"我起来了，但我连不上"。
+     */
+    private fun beepStartupFailure() {
+        beep(TONE_ERROR, BEEP_ERROR_MS)
+        lastErrorBeepAt = System.currentTimeMillis()
+        lifecycleScope.launch {
+            delay(ERROR_DOUBLE_GAP_MS)
+            beep(TONE_ERROR, BEEP_ERROR_MS)
         }
     }
 
@@ -895,16 +974,29 @@ class MainActivity : AppCompatActivity() {
      * @param onDone 播完之后的回调，**主线程**。注意播放被打断时不会触发
      *               （[releaseCurrentPlayer] 走的是 stop + release，不触发 onCompletion），
      *               所以调用方必须自己带超时兜底 —— 见 [speakThenExit]。
+     * @param onFail 这句话**没能送到用户耳朵里**时的回调，**主线程**。
+     *               合成失败（网络/鉴权/服务）和播放失败都会走这里。
+     *               默认行为是响一声错误提示音，因为"什么都没说"和"说了一句话"
+     *               在听觉上是完全不同的两件事，而用户看不见屏幕上写了什么。
      */
-    private fun speak(text: String, onDone: (() -> Unit)? = null) {
+    private fun speak(text: String, onDone: (() -> Unit)? = null, onFail: (() -> Unit)? = null) {
         // 静音检查放在调用方线程上同步判断，而不是丢进线程池里再判：
         // "安静"这条指令需要"先播确认、再置标志"，顺序反过来那句确认就出不来了。
+        // 注意这里提前返回**不算失败** —— 用户自己要求的安静，不该响错误音。
         if (voiceDisabled || ttsStopped || muted) return
         lastSpokenText = text
         val vol = VOLUME_LEVELS[volumeLevel]
         val speed = SPEED_LEVELS[speedLevel]
         ttsExecutor.execute {
-            val wav = api.synthesize(text) ?: return@execute
+            val wav = api.synthesize(text)
+            if (wav == null) {
+                // 原先这里是 `?: return@execute` —— 网络一断，应用就变成哑巴，
+                // 而且不响、不报、不提示，用户以为是自己没按到按钮。
+                Log.w(TAG, "TTS 合成失败（网络或服务）：${text.take(40)}")
+                beepError()
+                if (onFail != null) runOnUiThread { runCatching { onFail() } }
+                return@execute
+            }
             // synthesize() 是阻塞的网络请求，shutdownNow() 打断不了它，
             // 所以拿到结果之后必须再看一眼是否已经进入销毁流程。
             if (capture.isRecording || ttsStopped) return@execute
@@ -944,7 +1036,13 @@ class MainActivity : AppCompatActivity() {
                 applySpeed(player, speed)
                 player.start()
             } catch (e: Exception) {
-                // 播放失败不影响主流程
+                // 原先这里写的是"播放失败不影响主流程"，对这个应用恰恰相反：
+                // 唯一的输出通道就是声音，播放失败等于一个字都没送到用户耳朵里。
+                // 尤其是退出确认 —— 问了"确定要退出吗"却没播出来，
+                // 用户根本不知道应用在等他回话，八秒后自己退了。
+                Log.w(TAG, "TTS 播放失败：$e")
+                beepError()
+                if (onFail != null) runOnUiThread { runCatching { onFail() } }
             }
         }
     }
@@ -1122,6 +1220,29 @@ class MainActivity : AppCompatActivity() {
         private const val TONE_START = ToneGenerator.TONE_PROP_BEEP
         private const val BEEP_VOLUME = 80
         private const val BEEP_MS = 120
+
+        /**
+         * 出错提示音。
+         *
+         * 用 `TONE_PROP_NACK`（negative acknowledgement，一声低沉的"否"），
+         * 和开始录音的 [TONE_START]（清脆一声"哔"）在音高上完全不同，
+         * 用户不用学就能分辨 —— 这很关键，因为它是**唯一不依赖网络**的输出通道：
+         * TTS 挂了的时候，这声"否"是应用还能说出的最后一句话。
+         */
+        private const val TONE_ERROR = ToneGenerator.TONE_PROP_NACK
+        private const val BEEP_ERROR_MS = 220
+
+        /** 两声错误音的间隔（启动时用来表示"我起来了，但我连不上"）。 */
+        private const val ERROR_DOUBLE_GAP_MS = 260L
+
+        /**
+         * 错误音的最小间隔。
+         *
+         * 距离播报每 5 秒一次，网络一断就会连着失败 —— 不设限的话会变成
+         * 每隔几秒一声"否"，像报警器一样吵，用户第一反应是把应用关掉。
+         * 3 秒足够让人注意到，又不至于变成噪声。
+         */
+        private const val ERROR_BEEP_MIN_GAP_MS = 3000L
 
         /**
          * 音量档位。1.0 是设备当前音量，不能超过 —— 想更大只能按硬件音量键。

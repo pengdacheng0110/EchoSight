@@ -60,8 +60,34 @@ class VoiceApi(private val apiKey: String) {
         }
     }
 
-    /** 上传 wav 识别，返回文本；失败返回空串。 */
-    fun transcribe(wav: ByteArray): String {
+    /**
+     * 一次识别请求的结果。
+     *
+     * 为什么不能再用「失败返回空串」：调用方拿到空串只能理解为"没听到人声"，
+     * 于是播报「没有听清，请靠近手机再说一次」。可真实原因可能是网络不通、
+     * Key 过期、服务限流 —— **那跟用户说得好不好没有半点关系**。
+     * 对盲人用户，"被指责没听清"是最坏的一种反馈：他只会越说越大声、
+     * 越凑越近，反复重试永远出不去，而屏幕上一切正常。
+     *
+     * 所以把"服务没答上来"和"答上来了但内容是空"拆成两个类型，
+     * 让编译器逼着调用方分别处理。
+     */
+    sealed class AsrResult {
+        /**
+         * 请求成功。[text] 为空串表示服务确实没听出内容
+         * （用户没说话、说得太轻，或全是环境噪声）—— 这时才是用户的锅。
+         */
+        data class Ok(val text: String) : AsrResult()
+
+        /**
+         * 请求本身没成功。[code] 为 HTTP 状态码，网络层异常时为 -1。
+         * 这**不是**用户的问题，绝不能播报成"没听清"。
+         */
+        data class Failed(val code: Int, val detail: String) : AsrResult()
+    }
+
+    /** 上传 wav 识别。区分"服务失败"与"听到空内容"，见 [AsrResult]。 */
+    fun transcribe(wav: ByteArray): AsrResult {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", "senseaudio-asr-1.5-260319")
@@ -78,17 +104,20 @@ class VoiceApi(private val apiKey: String) {
         return try {
             client.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) {
-                    Log.w("VoiceApi", "ASR失败 ${r.code}")
-                    return ""
+                    // 把服务端返回的正文带一小段出来，便于日志里直接看出是
+                    // Key 过期、额度用完还是服务错误 —— 这几种的处理方式完全不同。
+                    val body = runCatching { r.body?.string().orEmpty() }.getOrDefault("")
+                    Log.w("VoiceApi", "ASR失败 ${r.code}：${body.take(200)}")
+                    return AsrResult.Failed(r.code, body.take(200))
                 }
                 val text = JSONObject(r.body!!.string())
                     .optString("text", "").trim()
                 Log.i("VoiceApi", "听到: $text")
-                text
+                AsrResult.Ok(text)
             }
         } catch (e: Exception) {
             Log.w("VoiceApi", "ASR异常 $e")
-            ""
+            AsrResult.Failed(-1, e.toString().take(200))
         }
     }
 
