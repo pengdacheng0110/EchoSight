@@ -96,6 +96,9 @@ jobs:
             cert=${cert:-未知}
           fi
 
+          # 把摘要打进日志，跨次构建可以直接比对这一行
+          echo "签名证书 SHA-256: $cert"
+
           # 找不到 apksigner 只告警，不让构建失败；但只要读到了证书，就必须对得上。
           if [ "$cert" = "未知" ]; then
             echo "::warning title=未能读取签名::没找到 apksigner，跳过签名校验"
