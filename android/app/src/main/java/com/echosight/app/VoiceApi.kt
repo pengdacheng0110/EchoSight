@@ -155,7 +155,9 @@ class VoiceApi(private val apiKey: String) {
  *     写死一个绝对阈值在安静房间里能用、在街边就完全失效（一直不静音）；
  *   * 门限 = max(噪声底 × [NOISE_FACTOR], [ABS_FLOOR])。绝对下限是给
  *     "一点开就立刻开口、还没来得及估噪声底"的情况兜底的；
- *   * 出现过人声之后，连续 [SILENCE_FRAMES] 帧低于门限就自动结束；
+ *   * 出现过人声之后，连续静音满 [SILENCE_BYTES]（800ms）就自动结束；
+ *     静音时长按**字节**累计而不是"读了几次" —— `AudioRecord.read`
+ *     允许短读，按次数算的话短读会让 800ms 缩水成一百多毫秒；
  *   * 一直没听到人声超过 [NO_SPEECH_MS] 就结束，并把原因报出去，
  *     让界面说"没听到声音"，而不是发一段空白音频去浪费一次识别；
  *   * 硬上限 [MAX_MS] 兜住"环境噪声一直高于门限所以永远不静音"的情况
@@ -286,7 +288,7 @@ class VoiceCapture {
     /** 读循环。**运行在录音线程上**。 */
     private fun readLoop(rec: AudioRecord) {
         val frame = ByteArray(FRAME_BYTES)
-        var framesRead = 0
+        var bytesRead = 0L
         var calibFrames = 0
         // 噪声底取**最小值**而不是最大值：开始录音前会放一声提示音，
         // 那 120ms 必然落在 300ms 的标定窗口里。取最大值的话噪声底会被
@@ -294,7 +296,11 @@ class VoiceCapture {
         // 结果每次都走"没听到声音"。取最小值就能自动躲开这个瞬态。
         var noiseFloor = Double.MAX_VALUE
         var speechSeen = false
-        var silenceRun = 0
+        // 静音时长按**字节**累加，不按读到的次数累加。
+        // AudioRecord.read 是允许短读的（要多少不一定给多少），
+        // 按次数算的话：每次只返回 20ms 时，"连续 8 次静音"实际只有 160ms，
+        // 用户刚停顿换口气就被判定说完了。按字节算就跟读多大块无关。
+        var silentBytes = 0L
         var reason = StopReason.MANUAL
 
         while (recording) {
@@ -307,9 +313,10 @@ class VoiceCapture {
             }
             if (n <= 0) continue
             synchronized(lock) { pcmOut.write(frame, 0, n) }
-            framesRead++
+            bytesRead += n
             val rms = rms(frame, n)
-            val elapsedMs = framesRead * FRAME_MS
+            // 时长一律由字节数换算，不假设"每次读回整整一帧"
+            val elapsedMs = bytesRead * 1000L / (sampleRate * 2L)
 
             // 开头几帧只用来估本机噪声底，不参与"有没有人声"的判断
             if (calibFrames < NOISE_CALIB_FRAMES) {
@@ -322,10 +329,10 @@ class VoiceCapture {
 
             if (rms > threshold) {
                 speechSeen = true
-                silenceRun = 0
+                silentBytes = 0
             } else if (speechSeen) {
-                silenceRun++
-                if (silenceRun >= SILENCE_FRAMES) {
+                silentBytes += n
+                if (silentBytes >= SILENCE_BYTES) {
                     reason = StopReason.AUTO_SILENCE
                     break
                 }
@@ -404,8 +411,12 @@ class VoiceCapture {
         /** PCM16 的绝对下限：安静设备上噪声底可能接近 0，光靠倍数会过于灵敏。 */
         const val ABS_FLOOR = 250.0
 
-        /** 连续多少帧静音后认为说完了（8 帧 ≈ 800ms）。 */
-        const val SILENCE_FRAMES = 8
+        /**
+         * 连续静音多少**字节**后认为说完了。
+         * 16000Hz × 2 字节 × 0.8 秒 = 25600。用字节而不是"读了几次"，
+         * 理由见 readLoop 里的注释。
+         */
+        const val SILENCE_BYTES = 16000L * 2L * 800L / 1000L
 
         /** 一直没人说话就结束，别让用户对着"正在听"干等。 */
         const val NO_SPEECH_MS = 6000L
