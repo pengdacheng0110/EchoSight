@@ -65,17 +65,27 @@ class MainActivity : AppCompatActivity() {
     private var frameErrorStreak = 0
 
     // ---------------- 目标状态 ----------------
+    //
+    // 下面这几个字段**两个线程都会写**：
+    //   * 分析线程 —— processFrame() 每帧更新"上次看到/上次播报"的时间戳；
+    //   * 主线程   —— switchTarget() 在切目标时把它们重置（走 lifecycleScope，
+    //                 默认 Dispatchers.Main）。
+    // 所以全部标 @Volatile。原先只有 targetId / standby / lastSeenHit 标了，
+    // 这几个漏了 —— 漏掉不会崩，但主线程写进去的"刚刚重置过"分析线程可能看不见，
+    // 于是切目标之后第一次播报会拿着**上一个目标的** lastSpokenDist 去算差值，
+    // 张口就说"注意，你在远离目标"。用户什么都没做，却被告知正在远离。
+    // 单个字段的可见性缺失，最后表现为一句错误的方向判断。
     @Volatile private var targetId: Int? = null
     @Volatile private var standby = false
-    private var searchStart = 0L
-    private var lastLosePrompt = 0L
-    private var lastFoundReport = 0L
-    private var ttsCounter = 0
+    @Volatile private var searchStart = 0L
+    @Volatile private var lastLosePrompt = 0L
+    @Volatile private var lastFoundReport = 0L
+    private var ttsCounter = 0          // 只在 ttsExecutor 线程上读写
 
     // 用于进展播报与丢失记忆
-    private var lastSpokenDist: Float? = null
+    @Volatile private var lastSpokenDist: Float? = null
     @Volatile private var lastSeenHit: Guidance.Hit? = null
-    private var lastSeenTime = 0L
+    @Volatile private var lastSeenTime = 0L
 
     // 测距时序滤波：跨帧复用，切换目标时重置
     private val tracker = DistanceTracker()
