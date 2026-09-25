@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?><!-- 状态指示点：白色实心圆，颜色由 backgroundTint 在运行时按状态给 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="@android:color/white" />
+</shape>

@@ -6,9 +6,41 @@
     <!-- 品牌主色（绿色，呼应"视见"） -->
     <color name="primary">#FF2E7D32</color>
 
+    <!--
+      画布底色。相机预览按 fitCenter 居中，四周必然留边；
+      主题是 DayNight，浅色模式下 ?android:colorBackground 接近白色，
+      留白会变成刺眼的白框，所以这里固定用深色画布底。
+    -->
+    <color name="canvas_bg">#FF0B0F12</color>
+
     <!-- 状态卡片 -->
-    <color name="status_card_bg">#E61B1B1F</color>
-    <color name="status_card_text">#FFE6E6E6</color>
+    <color name="status_card_bg">#F21B1B1F</color>
+    <color name="status_card_stroke">#33FFFFFF</color>
+    <color name="status_card_text">#FFF5F5F5</color>
+    <color name="status_card_sub">#B3FFFFFF</color>
+
+    <!-- 状态强调色：指示点与图标共用 -->
+    <color name="state_idle">#FF90A4AE</color>
+    <color name="state_searching">#FFFFB300</color>
+    <color name="state_found">#FF43A047</color>
+    <color name="state_standby">#FF1E88E5</color>
+    <color name="state_error">#FFE53935</color>
+
+    <!-- 目标框：最近目标高亮，其余目标压低对比度 -->
+    <color name="box_primary">#FF00E676</color>
+    <color name="box_secondary">#8C9EFF9E</color>
+    <color name="box_shadow">#66000000</color>
+    <color name="box_label_bg">#E6000000</color>
+    <color name="box_label_bg_primary">#F200E676</color>
+    <color name="box_label_text_primary">#FF06210F</color>
+    <color name="reticle">#66FFFFFF</color>
+
+    <!-- 方位条 -->
+    <color name="bearing_track">#33FFFFFF</color>
+    <color name="bearing_tick">#59FFFFFF</color>
+    <color name="bearing_center">#99FFFFFF</color>
+    <color name="bearing_marker">#FFFFB300</color>
+    <color name="bearing_marker_halo">#4DFFB300</color>
 
     <!-- 说话按钮 -->
     <color name="mic_button">#FF1565C0</color>

@@ -67,13 +67,58 @@ ALIASES = {
 }
 
 # ---------------- 各类真实世界高度（米），用于单目测距 ----------------
+# 覆盖全部 COCO 80 类。原先只填了 20 类，其余全部兜底 0.3 米，
+# 导致椅子(0.9)被当成 0.3、长凳(0.85)被当成 0.3，测距直接差 3 倍。
+# 这里按"物体典型竖直尺寸"填写；姿态多变的类别（球、滑板、书…）取最常见摆放姿态。
 REAL_HEIGHT = {
-    "person": 1.7, "bicycle": 1.1, "car": 1.5, "motorcycle": 1.2,
-    "bus": 3.0, "truck": 3.0, "bottle": 0.25, "cup": 0.10,
-    "cell phone": 0.15, "remote": 0.18, "book": 0.20, "laptop": 0.25,
-    "chair": 0.9, "backpack": 0.5, "tv": 0.7, "keyboard": 0.15,
-    "mouse": 0.04, "umbrella": 0.9, "cat": 0.25, "dog": 0.45,
+    # --- 人与交通 ---
+    "person": 1.70, "bicycle": 1.10, "car": 1.50, "motorcycle": 1.20,
+    "airplane": 4.00, "bus": 3.00, "train": 3.80, "truck": 3.00,
+    "boat": 2.00, "traffic light": 0.90, "fire hydrant": 0.75,
+    "stop sign": 0.75, "parking meter": 1.20, "bench": 0.85,
+    # --- 动物 ---
+    "bird": 0.15, "cat": 0.25, "dog": 0.45, "horse": 1.60,
+    "sheep": 0.80, "cow": 1.40, "elephant": 2.80, "bear": 1.30,
+    "zebra": 1.40, "giraffe": 4.50,
+    # --- 随身物品 ---
+    "backpack": 0.50, "umbrella": 0.90, "handbag": 0.30, "tie": 0.45,
+    "suitcase": 0.65,
+    # --- 运动器材 ---
+    "frisbee": 0.27, "skis": 1.70, "snowboard": 1.50, "sports ball": 0.22,
+    "kite": 0.80, "baseball bat": 0.85, "baseball glove": 0.30,
+    "skateboard": 0.80, "surfboard": 1.80, "tennis racket": 0.70,
+    # --- 餐具与食物 ---
+    "bottle": 0.25, "wine glass": 0.20, "cup": 0.10, "fork": 0.19,
+    "knife": 0.24, "spoon": 0.18, "bowl": 0.08, "banana": 0.20,
+    "apple": 0.08, "sandwich": 0.10, "orange": 0.08, "broccoli": 0.15,
+    "carrot": 0.18, "hot dog": 0.10, "pizza": 0.30, "donut": 0.10,
+    "cake": 0.15,
+    # --- 家具家电 ---
+    "chair": 0.90, "couch": 0.85, "potted plant": 0.60, "bed": 0.60,
+    "dining table": 0.75, "toilet": 0.75, "tv": 0.70, "laptop": 0.25,
+    "mouse": 0.04, "remote": 0.18, "keyboard": 0.15, "cell phone": 0.15,
+    "microwave": 0.30, "oven": 0.90, "toaster": 0.20, "sink": 0.25,
+    "refrigerator": 1.75, "book": 0.20, "clock": 0.30, "vase": 0.30,
+    "scissors": 0.20, "teddy bear": 0.40, "hair drier": 0.25,
+    "toothbrush": 0.19,
 }
+
+# 高度先验"可信"的类别：刚性、竖直放置、且通常直接立在地面上，
+# 检测框高度 ≈ 真实高度。融合测距时给这些类别更高权重。
+# 其余类别（小物件、可变形、姿态多变）可见高度随视角剧烈变化，权重调低。
+TRUSTED_HEIGHT = frozenset({
+    "person", "bicycle", "car", "motorcycle", "bus", "train", "truck",
+    "boat", "fire hydrant", "stop sign", "parking meter", "bench",
+    "horse", "cow", "elephant", "bear", "zebra", "giraffe",
+    "chair", "couch", "potted plant", "dining table", "toilet",
+    "refrigerator", "oven", "microwave", "sink", "tv",
+})
+
+
+def height_trust(en):
+    """该类别的高度先验是否可信（用于融合权重）。"""
+    return en in TRUSTED_HEIGHT
+
 
 
 def match_target(text):

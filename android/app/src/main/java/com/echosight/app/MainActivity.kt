@@ -2,12 +2,14 @@ package com.echosight.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.os.Bundle
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,7 +36,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var overlay: OverlayView
     private lateinit var statusCard: MaterialCardView
+    private lateinit var statusDot: View
+    private lateinit var statusIcon: ImageView
     private lateinit var statusText: TextView
+    private lateinit var statusSub: TextView
+    private lateinit var bearing: BearingView
     private lateinit var pushButton: MaterialButton
 
     private lateinit var detector: YoloDetector
@@ -56,6 +62,12 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lastSeenHit: Guidance.Hit? = null
     private var lastSeenTime = 0L
 
+    // 测距时序滤波：跨帧复用，切换目标时重置
+    private val tracker = DistanceTracker()
+
+    // 相机俯仰角（重力传感器），供地面法测距使用
+    private lateinit var tilt: CameraTilt
+
     private val permissionLauncher: ActivityResultLauncher<Array<String>> =
         registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -63,7 +75,8 @@ class MainActivity : AppCompatActivity() {
             result[Manifest.permission.RECORD_AUDIO] == true) {
             startEverything()
         } else {
-            statusText.text = "需要相机和麦克风权限才能使用，点这里重新授权"
+            updateHud(getString(R.string.status_need_permission), "", UiState.ERROR)
+            // updateHud 会清掉卡片点击监听，这里补回来，让用户能点卡片重新授权
             statusCard.setOnClickListener { requestPermissions() }
         }
     }
@@ -77,11 +90,15 @@ class MainActivity : AppCompatActivity() {
         previewView = findViewById(R.id.previewView)
         overlay = findViewById(R.id.overlayView)
         statusCard = findViewById(R.id.statusCard)
+        statusDot = findViewById(R.id.statusDot)
+        statusIcon = findViewById(R.id.statusIcon)
         statusText = findViewById(R.id.statusText)
+        statusSub = findViewById(R.id.statusSub)
+        bearing = findViewById(R.id.bearingView)
         pushButton = findViewById(R.id.pushButton)
 
         if (BuildConfig.SENSEAUDIO_KEY.isBlank()) {
-            statusText.text = "未配置语音接口 Key，APK 无法使用云端语音，请联系开发者"
+            updateHud(getString(R.string.status_no_key), "", UiState.ERROR)
         }
 
         if (hasPermissions()) startEverything() else requestPermissions()
@@ -100,6 +117,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun startEverything() {
         detector = YoloDetector(this)
+        tilt = CameraTilt(this)
+        tilt.start()
         bindCamera()
         bindPushButton()
         speak("回声视见已启动。请问你要寻找什么物品？请按住屏幕下方的大按钮，对着手机说话，说完松手。")
@@ -140,14 +159,15 @@ class MainActivity : AppCompatActivity() {
 
         if (tid == null) {
             overlay.drawBoxes = emptyList()
-            setStatus("等待指令：按住下方大按钮说话")
+            frameHud("等待指令：按住下方大按钮说话",
+                getString(R.string.sub_no_target), UiState.IDLE)
             return
         }
         val frameW = detector.frameWidth.toFloat()
         val frameH = detector.frameHeight.toFloat()
 
         val hits = boxes.filter { it.cls == tid }.map {
-            Guidance.buildHit(it, frameW, frameH, tid)
+            Guidance.buildHit(it, frameW, frameH, tid, tilt.depressionDeg)
         }
         val cn = Labels.CLASS_CN[tid]
 
@@ -156,24 +176,37 @@ class MainActivity : AppCompatActivity() {
             overlay.drawBoxes = hits.map {
                 DrawBox(it.box, "${cn} ${it.direction}")
             }
-            setStatus("已找到，安静待命中。要换东西就按住按钮说：找某某")
+            frameHud("已找到${cn}，安静待命中",
+                getString(R.string.sub_standby), UiState.STANDBY)
             return
         }
 
         if (hits.isNotEmpty()) {
             searchStart = now
-            val nearest = hits.maxBy {
-                (it.box.y2 - it.box.y1) * (it.box.x2 - it.box.x1) }
+            // 面积最大的框视为最近目标；只对它做时序平滑，否则同一画面里
+            // 多个同类目标（比如三把椅子）的距离会被混进同一个滤波器。
+            val nearIdx = hits.indices.maxByOrNull {
+                (hits[it].box.y2 - hits[it].box.y1) *
+                    (hits[it].box.x2 - hits[it].box.x1)
+            } ?: 0
+            val nearest = tracker.smooth(tid, hits[nearIdx], now)
+            val shown = hits.mapIndexed { i, h -> if (i == nearIdx) nearest else h }
             lastSeenHit = nearest
             lastSeenTime = now
 
-            overlay.drawBoxes = hits.map {
-                DrawBox(it.box,
-                    "${cn} ${it.direction} ${"%.1f".format(it.dist)}米")
+            overlay.drawBoxes = shown.mapIndexed { i, h ->
+                DrawBox(h.box,
+                    "${cn} ${h.direction} ${"%.1f".format(h.dist)}米",
+                    i == nearIdx)
             }
-            setStatus("找到${hits.size.let { if (it > 1) "${it}个" else "" }}$cn：" +
+            frameHud(
+                "找到${hits.size.let { if (it > 1) "${it}个" else "" }}$cn：" +
                     "${nearest.direction}·${nearest.vertical} " +
-                    "${"%.1f".format(nearest.dist)}米")
+                    "${"%.1f".format(nearest.dist)}米",
+                getString(R.string.sub_distance,
+                    "%.1f".format(nearest.dist), sourceLabel(nearest)),
+                UiState.FOUND,
+                nearest.angleDeg)
 
             if (now - lastFoundReport > FOUND_REPORT_INTERVAL) {
                 val prev = lastSpokenDist
@@ -190,7 +223,8 @@ class MainActivity : AppCompatActivity() {
         } else {
             overlay.drawBoxes = emptyList()
             val age = now - lastSeenTime
-            setStatus("寻找$cn 中…")
+            frameHud("寻找$cn 中…",
+                getString(R.string.sub_searching), UiState.SEARCHING)
             if (now - searchStart > 4000 &&
                 now - lastLosePrompt > LOSE_PROMPT_INTERVAL) {
                 speak(Guidance.lostReport(cn, lastSeenHit, age))
@@ -207,16 +241,19 @@ class MainActivity : AppCompatActivity() {
                     v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     stopSpeaking()
                     ptt.start()
-                    pushButton.text = "松开\n识别"
+                    setRecordingUi(true)
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     val wav = ptt.stop()
-                    pushButton.text = "按住\n说话"
+                    setRecordingUi(false)
                     if (event.action == MotionEvent.ACTION_UP && wav.size > 1000) {
                         sendForAsr(wav)
                     } else if (event.action == MotionEvent.ACTION_UP) {
+                        updateHud("说话时间太短了，请按住按钮多说一会儿。",
+                            getString(R.string.sub_searching), UiState.SEARCHING,
+                            holdMs = 2500L)
                         speak("说话时间太短了，请按住按钮多说一会儿。")
                     }
                     true
@@ -226,8 +263,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 录音态的视觉反馈：按钮变红 + 文案切换，状态卡片同步进入"聆听"状态。
+     * （原先 [R.color.mic_button_recording] 定义了却从未被使用，按钮录音时不会变色。）
+     */
+    private fun setRecordingUi(recording: Boolean) {
+        pushButton.setText(if (recording) R.string.btn_talk_listening else R.string.btn_talk)
+        pushButton.backgroundTintList = ColorStateList.valueOf(
+            ContextCompat.getColor(this,
+                if (recording) R.color.mic_button_recording else R.color.mic_button))
+        if (recording) {
+            updateHud("正在聆听，请说话", getString(R.string.sub_recognizing),
+                UiState.LISTENING, holdMs = 30_000L)
+        }
+        // 松手后的状态交给 sendForAsr 或"说话太短"分支，它们各自带占位时间
+    }
+
     private fun sendForAsr(wav: ByteArray) {
-        setStatus("正在识别，请稍等…")
+        updateHud("正在识别，请稍等…", getString(R.string.sub_recognizing),
+            UiState.SEARCHING, holdMs = 2500L)
         lifecycleScope.launch {
             val text = withContext(Dispatchers.IO) { api.transcribe(wav) }
             when (val cmd = Labels.parseCommand(text)) {
@@ -260,7 +314,9 @@ class MainActivity : AppCompatActivity() {
         lastSpokenDist = null
         lastSeenHit = null
         lastSeenTime = 0L
-        setStatus("当前目标：$cn")
+        tracker.reset()
+        updateHud("当前目标：$cn", getString(R.string.sub_searching),
+            UiState.SEARCHING, holdMs = 2500L)
         speak("好的，现在帮你寻找$cn。请把手机摄像头对准前方，慢慢转动身体，我会告诉你它在哪里。")
     }
 
@@ -308,13 +364,74 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setStatus(text: String) = runOnUiThread {
-        statusText.text = text
-        statusCard.setOnClickListener(null)
+    // ---------------- 顶部信息区状态 ----------------
+
+    /** 状态卡片外观：指示点与图标共用强调色，图标形状区分语义。 */
+    private enum class UiState(val colorRes: Int, val iconRes: Int) {
+        IDLE(R.color.state_idle, R.drawable.ic_visibility),
+        SEARCHING(R.color.state_searching, R.drawable.ic_search),
+        FOUND(R.color.state_found, R.drawable.ic_target),
+        STANDBY(R.color.state_standby, R.drawable.ic_check),
+        LISTENING(R.color.state_error, R.drawable.ic_mic),
+        ERROR(R.color.state_error, R.drawable.ic_error),
     }
+
+    /** 临时提示的占位截止时间：在此之前不让每帧的状态刷新把它冲掉。 */
+    @Volatile private var hudHoldUntil = 0L
+
+    /**
+     * 更新顶部信息区（状态卡片 + 方位条）。
+     *
+     * @param bearingAngle 方位条游标角度，NaN 表示隐藏方位条
+     * @param holdMs 大于 0 时，这段时间内不接受 [frameHud] 的覆盖，
+     *               用于"正在聆听 / 正在识别"这类一闪而过的临时提示
+     */
+    private fun updateHud(
+        text: String,
+        sub: String,
+        state: UiState,
+        bearingAngle: Float = Float.NaN,
+        holdMs: Long = 0L,
+    ) {
+        if (holdMs > 0L) hudHoldUntil = System.currentTimeMillis() + holdMs
+        runOnUiThread {
+            statusText.text = text
+            statusSub.text = sub
+            val c = ContextCompat.getColor(this, state.colorRes)
+            statusDot.backgroundTintList = ColorStateList.valueOf(c)
+            statusIcon.setImageResource(state.iconRes)
+            statusIcon.imageTintList = ColorStateList.valueOf(c)
+            if (bearingAngle.isNaN()) {
+                bearing.visibility = View.INVISIBLE
+                bearing.angleDeg = null
+            } else {
+                bearing.visibility = View.VISIBLE
+                bearing.angleDeg = bearingAngle
+            }
+            // 只有权限出错那条路径需要卡片可点，其余状态都清掉监听
+            statusCard.setOnClickListener(null)
+        }
+    }
+
+    /**
+     * 检测帧里的状态刷新。录音期间、以及临时提示占位期间都不更新，
+     * 否则"正在聆听 / 正在识别"会被下一帧（约 30fps）立刻冲掉。
+     */
+    private fun frameHud(
+        text: String, sub: String, state: UiState, bearingAngle: Float = Float.NaN
+    ) {
+        if (ptt.isRecording) return
+        if (System.currentTimeMillis() < hudHoldUntil) return
+        updateHud(text, sub, state, bearingAngle)
+    }
+
+    /** 测距来源的中文说法，显示在状态副标题里。 */
+    private fun sourceLabel(hit: Guidance.Hit): String = getString(
+        if (hit.source == "fused") R.string.source_fused else R.string.source_height)
 
     override fun onDestroy() {
         super.onDestroy()
+        if (::tilt.isInitialized) tilt.stop()
         ttsExecutor.shutdownNow()
         analysisExecutor.shutdownNow()
     }

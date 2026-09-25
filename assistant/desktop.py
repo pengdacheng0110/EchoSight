@@ -18,7 +18,7 @@ from . import config
 from .audio_api import listen
 from .detector import Detector
 from .display import draw_frame
-from .geometry import estimate
+from .geometry import DistanceEstimator
 from .labels import CLASS_CN, match_target
 from .speaker import set_playback_hooks, speak
 from .voice_command import VoiceListener
@@ -99,7 +99,8 @@ class DesktopApp:
             raise RuntimeError("无法打开摄像头")
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fx = frame_w * config.FX_FACTOR
+        # 测距器持有跨帧的滤波状态，整个扫描过程复用同一个实例
+        estimator = DistanceEstimator(frame_w, frame_h)
 
         search_start = time.time()
         last_lose_prompt = 0
@@ -122,21 +123,29 @@ class DesktopApp:
                 standby = self.standby
 
             detections = []
+            measures = []
             for x1, y1, x2, y2, cls, conf in self.detector.latest():
                 if cls != target_id:
                     continue
-                dist, direction = estimate(
-                    (x1, y1, x2, y2), fx, frame_w, target_en)
+                m = estimator.measure((x1, y1, x2, y2), target_en)
                 detections.append(
-                    (x1, y1, x2, y2, target_cn, conf, dist, direction))
+                    (x1, y1, x2, y2, target_cn, conf, m.dist, m.direction))
+                measures.append(m)
 
             if standby:
                 status = "已找到，安静待命。需要时请说：找XX"
             elif detections:
                 search_start = now
-                nearest = max(detections,
-                              key=lambda d: (d[3] - d[1]) * (d[2] - d[0]))
-                dist, direction = nearest[6], nearest[7]
+                # 面积最大的框视为最近目标；只对它做时序平滑，
+                # 否则同一画面里多个同类物体（比如三把椅子）的距离会被混在一起。
+                near_i = max(range(len(detections)),
+                             key=lambda i: (detections[i][3] - detections[i][1])
+                             * (detections[i][2] - detections[i][0]))
+                m = estimator.smooth(target_en, measures[near_i], now)
+                dist, direction = m.dist, m.direction
+                box = detections[near_i]
+                detections[near_i] = (box[0], box[1], box[2], box[3],
+                                      box[4], box[5], dist, direction)
                 status = f"找到{target_cn}：{direction} 约{dist:.1f}米"
                 if now - last_found_report > config.FOUND_REPORT_INTERVAL:
                     if dist < 0.5:
@@ -153,12 +162,13 @@ class DesktopApp:
 
             fps = 1 / (now - prev_t)
             prev_t = now
-            # 切换目标后重置搜索计时
+            # 切换目标后重置搜索计时与测距滤波
             if target_en != getattr(self, "_last_target", None):
                 self._last_target = target_en
                 search_start = now
                 last_lose_prompt = now
                 last_found_report = now
+                estimator.reset()
 
             shown = draw_frame(frame, detections, f"{status}   {fps:.0f}FPS")
             cv2.imshow("盲人识物助手 - 语音控制 Q退出", shown)

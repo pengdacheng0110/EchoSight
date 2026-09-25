@@ -31,6 +31,13 @@ android {
             isMinifyEnabled = false
             // 侧载分发：用自动生成的 debug 密钥签名，保证 APK 可直接安装
             signingConfig = signingConfigs.getByName("debug")
+            // onnxruntime 的原生库按 ABI 各带一份，四个 ABI 合计 70MB+，
+            // 其中 x86/x86_64 只有模拟器用得到，真机全是 ARM。
+            // 这里只保留 ARM 两个 ABI，包体直接减半；debug 构建不限制，
+            // 方便继续在 x86 模拟器里调试。
+            ndk {
+                abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+            }
         }
     }
 

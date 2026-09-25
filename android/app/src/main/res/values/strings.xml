@@ -1,4 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">回声视见</string>
+
+    <!-- 状态卡片 -->
+    <string name="status_starting">正在启动…</string>
+    <string name="status_need_permission">需要相机和麦克风权限才能使用，点这里重新授权</string>
+    <string name="status_no_key">未配置语音接口 Key，APK 无法使用云端语音，请联系开发者</string>
+
+    <!-- 状态副标题 -->
+    <string name="sub_no_target">尚未选择目标物品</string>
+    <string name="sub_searching">正在搜索 · 按住按钮可更换目标</string>
+    <string name="sub_standby">按住按钮说：找某某</string>
+    <string name="sub_target">当前目标：%1$s</string>
+    <string name="sub_recognizing">正在把你的话转成文字</string>
+    <string name="sub_distance">距离 %1$s 米 · %2$s</string>
+
+    <!-- 目标框标注 -->
+    <string name="box_label">%1$s %2$s %3$s米</string>
+    <string name="box_label_no_dist">%1$s %2$s</string>
+
+    <!-- 按住说话按钮 -->
+    <string name="btn_talk">按住\n说话</string>
+    <string name="btn_talk_listening">松开\n识别</string>
+    <string name="btn_talk_desc">按住说话，松手识别</string>
+
+    <!-- 测距来源 -->
+    <string name="source_fused">双模型融合</string>
+    <string name="source_height">仅高度法</string>
 </resources>
