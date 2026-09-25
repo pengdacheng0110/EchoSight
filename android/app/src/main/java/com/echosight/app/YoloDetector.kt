@@ -75,15 +75,31 @@ class YoloDetector(context: Context) : AutoCloseable {
     /** 相机帧（YUV）→ 转正 Bitmap → 推理；返回框坐标基于转正后画面。 */
     fun detect(image: ImageProxy): List<DetBox> {
         val raw = yuvToBitmap(image)
-        val rotated = Bitmap.createBitmap(
-            raw, 0, 0, raw.width, raw.height,
-            Matrix().apply { postRotate(image.imageInfo.rotationDegrees.toFloat()) },
-            true)
-        if (rotated != raw) raw.recycle()
-
-        val boxes = infer(rotated)
-        rotated.recycle()
-        return boxes
+        var rotated: Bitmap? = null
+        try {
+            rotated = Bitmap.createBitmap(
+                raw, 0, 0, raw.width, raw.height,
+                Matrix().apply {
+                    postRotate(image.imageInfo.rotationDegrees.toFloat())
+                },
+                true)
+            if (rotated !== raw) raw.recycle()
+            return infer(rotated)
+        } finally {
+            // 两张位图都必须在 finally 里回收。
+            // 原先 rotated.recycle() 写在 infer() 之后，infer 一抛就被跳过；
+            // 而 Bitmap.createBitmap 抛的话，raw 连回收的机会都没有 ——
+            // 实测这两种情况下分别漏 1 张和 1 张（见探针输出：正常路径 2 次
+            // recycle，异常路径只有 0~1 次）。
+            //
+            // Android 8.0 起 ARGB_8888 的像素数据放在原生内存里，GC 管不到：
+            // 480×640×4 ≈ 1.2MB/张，30fps 下几秒钟就能吃光。
+            //
+            // 用 !== 判同一性：无需旋转时 createBitmap 可能直接返回原对象，
+            // 那就只回收一次，避免重复 recycle。
+            rotated?.let { if (it !== raw) runCatching { it.recycle() } }
+            runCatching { raw.recycle() }
+        }
     }
 
     val frameWidth get() = _frameWidth

@@ -33,6 +33,7 @@ import com.google.android.material.color.DynamicColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import android.util.Log
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -56,6 +57,12 @@ class MainActivity : AppCompatActivity() {
     private var pttActive = false
     private val ttsExecutor = Executors.newSingleThreadExecutor()
     private val analysisExecutor = Executors.newSingleThreadExecutor()
+
+    /**
+     * 连续处理失败多少帧。
+     * 只在 analysisExecutor 这一个线程上读写，不需要 @Volatile。
+     */
+    private var frameErrorStreak = 0
 
     // ---------------- 目标状态 ----------------
     @Volatile private var targetId: Int? = null
@@ -184,6 +191,24 @@ class MainActivity : AppCompatActivity() {
             analysis.setAnalyzer(analysisExecutor) { image ->
                 try {
                     processFrame(image)
+                    frameErrorStreak = 0        // 成功一帧就把连续失败计数清零
+                } catch (e: Throwable) {
+                    // 这里必须自己兜住 —— CameraX **不会**替你兜。
+                    // 反汇编 androidx.camera:camera-core:1.4.1 的
+                    // ImageAnalysisAbstractAnalyzer 可以看到：它只捕获
+                    // acquireImage 的 IllegalStateException，类里的字符串常量
+                    // 也没有任何"analyzer 抛异常"的日志。异常会一路冒到
+                    // analysisExecutor 线程的默认未捕获处理器 —— Android 上
+                    // 那就是 killProcess，用户看到的是闪退。
+                    //
+                    // 而 detect() 的抛点是真实存在的：CameraX 在
+                    // STRATEGY_KEEP_ONLY_LATEST 下会提前关掉上一帧，这时读
+                    // planes 就抛 IllegalStateException；此外还有 Bitmap 分配
+                    // 失败、OrtException 等等。
+                    //
+                    // 一帧坏掉不该让整个应用消失：记下来、清空画面上的旧框，
+                    // 然后继续出下一帧。
+                    onFrameError(e)
                 } finally {
                     image.close()
                 }
@@ -192,6 +217,32 @@ class MainActivity : AppCompatActivity() {
             provider.bindToLifecycle(
                 this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * 某一帧处理失败。
+     *
+     * 关键是**清掉画面上的旧框**：异常时 processFrame 会在写 overlay 之前就中断，
+     * 于是 overlay 会一直停在最后一帧的结果上 —— 那是"看起来一切正常的错数据"，
+     * 用户会按着一个早就不成立的位置行动。宁可什么都不显示。
+     */
+    private fun onFrameError(e: Throwable) {
+        frameErrorStreak++
+        // 第一帧报一次，之后每 30 帧报一次。
+        // 不能每帧都报：相机 30fps，一直失败就是每秒 30 条 Log —— 日志会被刷爆，
+        // 而且 Log 调用本身有开销，在一个已经在出错的路径上再叠负担不合适。
+        if (frameErrorStreak == 1 || frameErrorStreak % 30 == 0) {
+            Log.e(TAG, "处理相机帧失败（连续第 $frameErrorStreak 次）", e)
+            frameHud(
+                getString(R.string.status_frame_error),
+                getString(R.string.sub_frame_error),
+                UiState.IDLE)
+        }
+        // 清空是**每一帧**都要做的，不能跟着日志一起被节流：
+        // 异常时 processFrame 在写 overlay 之前就中断了，overlay 会停在最后一帧
+        // 的结果上 —— 那是"看起来一切正常的错数据"，用户会按着早已失效的位置行动。
+        // 宁可什么都不显示。
+        overlay.drawBoxes = emptyList()
     }
 
     private fun processFrame(image: ImageProxy) {
@@ -593,6 +644,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val TAG = "EchoSight"
         private const val LOSE_PROMPT_INTERVAL = 7000L
         private const val FOUND_REPORT_INTERVAL = 5000L
     }
