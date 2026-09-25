@@ -34,7 +34,9 @@ class OverlayView @JvmOverloads constructor(
 
     var drawBoxes: List<DrawBox> = emptyList()
         set(value) {
-            field = value
+            // 排序挪到赋值处：onDraw 每帧都会跑，原先在里面 sortedBy
+            // 等于每帧新建一个列表（30fps 就是 30 次/秒的无谓分配）。
+            field = value.sortedBy { it.primary }
             postInvalidate()
         }
 
@@ -117,7 +119,8 @@ class OverlayView @JvmOverloads constructor(
         val edge = dp(4f)
 
         // 先画次要目标、后画最近目标，保证最近目标压在最上层
-        for (d in drawBoxes.sortedBy { it.primary }) {
+        // （顺序已在 drawBoxes 的 setter 里排好）
+        for (d in drawBoxes) {
             val b = d.box
             rect.set(
                 offX + b.x1 * scale, offY + b.y1 * scale,

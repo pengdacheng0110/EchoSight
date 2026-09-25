@@ -158,7 +158,14 @@ object Labels {
         for (alias in ALIASES.keys.sortedByDescending { it.length }) {
             if (text.contains(alias)) return ALIASES[alias]
         }
-        return null
+        // 兜底：直接按类别中文名匹配。
+        // ALIASES 是手工维护的口语表，漏了 6 个类别 —— 停车计时器(12)、
+        // 滑雪板(30/31)、棒球棒(34)、棒球手套(35)、冲浪板(37)。漏了就意味着
+        // 用户说"找冲浪板"会被当成没听懂，而目标物品只能靠语音指定，
+        // 这 6 类等于在这个应用里根本不存在。用 CLASS_CN 兜底后 80 类全覆盖，
+        // 以后新增别名也不会再出现这种"能看见、叫不出来"的类别。
+        val idx = CLASS_CN.indexOfFirst { it.isNotEmpty() && text.contains(it) }
+        return if (idx >= 0) idx else null
     }
 
     /** 解析 ASR 文本，返回 Found / Target / null。 */

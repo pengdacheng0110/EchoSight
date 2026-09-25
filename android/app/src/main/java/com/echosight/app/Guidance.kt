@@ -53,8 +53,14 @@ object Guidance {
     private const val DIST_MAX = 20f
 
     // ---- 方位分级阈值（度，负=左）----
-    private const val DIR_LEFT_DEG = -12f
-    private const val DIR_RIGHT_DEG = 12f
+    // 公开而非 private：BearingView 的刻度线必须跟这里严格对齐，
+    // 否则刻度落点和语音里说的"左前方 / 你的左侧"会打架。
+    //
+    // 原先这里是 DIR_LEFT_DEG = -12f / DIR_RIGHT_DEG = 12f，两个常量从头到尾
+    // 没人引用，而下面三个函数各自硬编码了 -10/10 —— 常量躺在那里给出一个
+    // 和实际行为不符的数值，读代码的人会以为分级边界是 ±12°。
+    const val DIR_CENTER_DEG = 10f   // 以内算"正前方"
+    const val DIR_SIDE_DEG = 35f     // 以外算"你的左侧 / 右侧"
 
     data class Hit(
         val box: DetBox,
@@ -71,10 +77,10 @@ object Guidance {
 
     /** 按相对身体的角度分级：不使用钟表方向。方位角被平滑后需重新判级，故公开。 */
     fun directionWords(angle: Float): String = when {
-        angle <= -35 -> "你的左侧"
-        angle <= -10 -> "左前方"
-        angle < 10 -> "正前方"
-        angle <= 35 -> "右前方"
+        angle <= -DIR_SIDE_DEG -> "你的左侧"
+        angle <= -DIR_CENTER_DEG -> "左前方"
+        angle < DIR_CENTER_DEG -> "正前方"
+        angle <= DIR_SIDE_DEG -> "右前方"
         else -> "你的右侧"
     }
 
@@ -168,10 +174,10 @@ object Guidance {
     fun actionTip(hit: Hit): String {
         val parts = ArrayList<String>()
         when {
-            hit.angleDeg <= -35 -> parts.add("请向左多转一些身体")
-            hit.angleDeg <= -10 -> parts.add("请把身体或手机向左转一点")
-            hit.angleDeg >= 35 -> parts.add("请向右多转一些身体")
-            hit.angleDeg >= 10 -> parts.add("请把身体或手机向右转一点")
+            hit.angleDeg <= -DIR_SIDE_DEG -> parts.add("请向左多转一些身体")
+            hit.angleDeg <= -DIR_CENTER_DEG -> parts.add("请把身体或手机向左转一点")
+            hit.angleDeg >= DIR_SIDE_DEG -> parts.add("请向右多转一些身体")
+            hit.angleDeg >= DIR_CENTER_DEG -> parts.add("请把身体或手机向右转一点")
         }
         when {
             hit.dist < 0.5f -> parts.add("就在面前，可以伸手摸了")
@@ -204,10 +210,10 @@ object Guidance {
     fun lostReport(name: String, last: Hit?, ageMs: Long): String {
         if (last != null && ageMs < 10_000) {
             val turn = when {
-                last.angleDeg <= -35 -> "请拿着手机向左多转一些去找"
-                last.angleDeg <= -10 -> "请把手机向左转一点去找"
-                last.angleDeg >= 35 -> "请拿着手机向右多转一些去找"
-                last.angleDeg >= 10 -> "请把手机向右转一点去找"
+                last.angleDeg <= -DIR_SIDE_DEG -> "请拿着手机向左多转一些去找"
+                last.angleDeg <= -DIR_CENTER_DEG -> "请把手机向左转一点去找"
+                last.angleDeg >= DIR_SIDE_DEG -> "请拿着手机向右多转一些去找"
+                last.angleDeg >= DIR_CENTER_DEG -> "请把手机向右转一点去找"
                 else -> "目标可能被挡住了，请原地慢慢转一圈找"
             }
             return "${name}刚刚还在${last.direction}，$turn。"

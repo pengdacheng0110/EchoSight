@@ -77,8 +77,13 @@ class BearingView @JvmOverloads constructor(
 
         canvas.drawLine(left, cy, right, cy, trackPaint)
 
-        // 与语音分级阈值对齐的刻度：±10° 是"正前方"的边界，±35° 是"侧方"的边界
-        for (a in floatArrayOf(-35f, -10f, 10f, 35f)) {
+        // 与语音分级阈值对齐的刻度：±DIR_CENTER_DEG 是"正前方"的边界，
+        // ±DIR_SIDE_DEG 是"侧方"的边界。数值直接取 Guidance 的常量，
+        // 不再各写一份 —— 两处硬编码迟早会改歪一个。
+        for (a in floatArrayOf(
+            -Guidance.DIR_SIDE_DEG, -Guidance.DIR_CENTER_DEG,
+            Guidance.DIR_CENTER_DEG, Guidance.DIR_SIDE_DEG
+        )) {
             val x = midX + half * (a / MAX_ANGLE)
             canvas.drawLine(x, cy - dp(5f), x, cy + dp(5f), tickPaint)
         }
