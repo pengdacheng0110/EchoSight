@@ -273,10 +273,15 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.getColor(this,
                 if (recording) R.color.mic_button_recording else R.color.mic_button))
         if (recording) {
+            // 录音期间靠 frameHud 的 ptt.isRecording 判断跳过刷新，这里的占位只是兜底
             updateHud("正在聆听，请说话", getString(R.string.sub_recognizing),
                 UiState.LISTENING, holdMs = 30_000L)
+        } else {
+            // 松手必须解除占位：ACTION_CANCEL（手指滑出按钮、手势被父容器抢走）时
+            // 下面两个分支都不会走，30 秒的占位会把状态卡片冻在"正在聆听"不动。
+            // 紧接着 sendForAsr 或"说话太短"分支会设它们自己的占位时间。
+            hudHoldUntil = 0L
         }
-        // 松手后的状态交给 sendForAsr 或"说话太短"分支，它们各自带占位时间
     }
 
     private fun sendForAsr(wav: ByteArray) {
@@ -379,6 +384,12 @@ class MainActivity : AppCompatActivity() {
     /** 临时提示的占位截止时间：在此之前不让每帧的状态刷新把它冲掉。 */
     @Volatile private var hudHoldUntil = 0L
 
+    // 上一次真正写进控件的值。检测帧约 30fps，而 setText / setImageResource 每次都会
+    // 触发重新测量或重新解析 VectorDrawable，内容没变就不该重复写。只在 UI 线程访问。
+    private var hudText: String? = null
+    private var hudSub: String? = null
+    private var hudState: UiState? = null
+
     /**
      * 更新顶部信息区（状态卡片 + 方位条）。
      *
@@ -395,12 +406,22 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (holdMs > 0L) hudHoldUntil = System.currentTimeMillis() + holdMs
         runOnUiThread {
-            statusText.text = text
-            statusSub.text = sub
-            val c = ContextCompat.getColor(this, state.colorRes)
-            statusDot.backgroundTintList = ColorStateList.valueOf(c)
-            statusIcon.setImageResource(state.iconRes)
-            statusIcon.imageTintList = ColorStateList.valueOf(c)
+            if (hudText != text) {
+                hudText = text
+                statusText.text = text
+            }
+            if (hudSub != sub) {
+                hudSub = sub
+                statusSub.text = sub
+            }
+            if (hudState != state) {
+                hudState = state
+                val c = ContextCompat.getColor(this, state.colorRes)
+                val tint = ColorStateList.valueOf(c)
+                statusDot.backgroundTintList = tint
+                statusIcon.setImageResource(state.iconRes)
+                statusIcon.imageTintList = tint
+            }
             if (bearingAngle.isNaN()) {
                 bearing.visibility = View.INVISIBLE
                 bearing.angleDeg = null

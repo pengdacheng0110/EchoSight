@@ -59,7 +59,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.2.0")
+    // 本项目的布局只有 FrameLayout / LinearLayout，代码里没有一处用到 ConstraintLayout，
+    // 不需要自己显式声明 2.2.0。material 会传递引入它需要的 2.0.1，APK 因此小约 200KB。
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
 
     // CameraX
