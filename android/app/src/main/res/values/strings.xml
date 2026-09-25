@@ -5,7 +5,7 @@
     <!-- 状态卡片 -->
     <string name="status_starting">正在启动…</string>
     <string name="status_need_permission">需要相机和麦克风权限才能使用，点这里重新授权</string>
-    <string name="status_no_key">未配置语音接口 Key，APK 无法使用云端语音，请联系开发者</string>
+    <string name="status_no_key">未配置语音接口 Key，语音功能不可用</string>
 
     <!-- 状态副标题 -->
     <string name="sub_no_target">尚未选择目标物品</string>
@@ -14,6 +14,7 @@
     <string name="sub_target">当前目标：%1$s</string>
     <string name="sub_recognizing">正在把你的话转成文字</string>
     <string name="sub_distance">距离 %1$s 米 · %2$s</string>
+    <string name="sub_no_key">配置 SENSEAUDIO_API_KEY 后重新打包</string>
 
     <!-- 目标框标注 -->
     <string name="box_label">%1$s %2$s %3$s米</string>

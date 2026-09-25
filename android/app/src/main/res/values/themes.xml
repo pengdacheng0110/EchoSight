@@ -4,7 +4,12 @@
         <!-- 冷启动窗口用深色画布底，避免启动瞬间闪一下白屏 -->
         <item name="android:windowBackground">@color/canvas_bg</item>
 
-        <!-- 相机取景界面固定深色，状态栏 / 导航栏都用浅色图标 -->
+        <!--
+          相机取景界面固定深色，状态栏 / 导航栏都用浅色图标。
+          注意：这两个 color 属性只对 API 26~34 生效 —— targetSdk 35 起 Android 15
+          强制 edge-to-edge，会把它们直接忽略。真正让出系统栏高度的是
+          MainActivity.applySystemBarInsets()，改这里不会影响 Android 15。
+        -->
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
         <item name="android:navigationBarColor">@color/canvas_bg</item>

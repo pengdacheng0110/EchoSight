@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.activity.result.ActivityResultLauncher
@@ -21,6 +22,10 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updateLayoutParams
+import androidx.core.view.updatePadding
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
@@ -97,9 +102,19 @@ class MainActivity : AppCompatActivity() {
         bearing = findViewById(R.id.bearingView)
         pushButton = findViewById(R.id.pushButton)
 
+        applySystemBarInsets()
+
         if (BuildConfig.SENSEAUDIO_KEY.isBlank()) {
-            updateHud(getString(R.string.status_no_key), "", UiState.ERROR)
+            // 没有 Key 时语音链路整条不可用。而目标物品只能靠语音指定（见 switchTarget），
+            // 所以这不是"功能降级"，是应用根本用不起来 —— 必须把话说清楚，
+            // 并且别再让用户去按一个按了没反应的按钮。
+            voiceDisabled = true
+            updateHud(getString(R.string.status_no_key),
+                getString(R.string.sub_no_key), UiState.ERROR)
+            pushButton.isEnabled = false
+            pushButton.alpha = 0.4f
         }
+        cleanStaleTtsFiles()
 
         if (hasPermissions()) startEverything() else requestPermissions()
     }
@@ -113,6 +128,33 @@ class MainActivity : AppCompatActivity() {
     private fun requestPermissions() {
         permissionLauncher.launch(
             arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+    }
+
+    /**
+     * 把系统栏高度让出来。
+     *
+     * targetSdk 35 起 Android 15 对应用强制 edge-to-edge，themes.xml 里的
+     * `statusBarColor` / `navigationBarColor` 会被直接忽略，窗口内容铺到状态栏和
+     * 导航栏底下 —— 顶部状态卡片会被时钟、电量压住，底部大按钮会被导航栏压住。
+     * 那两个主题属性只对 API 26~34 生效，所以这里必须自己补 insets。
+     *
+     * 基线值从 XML 现读，不在代码里再抄一份 16dp / 40dp，避免两处不一致。
+     * 同时带上 displayCutout，刘海屏上状态栏高度未必覆盖挖孔。
+     */
+    private fun applySystemBarInsets() {
+        val topBar = findViewById<View>(R.id.topBar)
+        val baseTop = topBar.paddingTop
+        val baseBottom = (pushButton.layoutParams as ViewGroup.MarginLayoutParams).bottomMargin
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout())
+            topBar.updatePadding(top = bars.top + baseTop)
+            pushButton.updateLayoutParams<ViewGroup.MarginLayoutParams> {
+                bottomMargin = bars.bottom + baseBottom
+            }
+            insets
+        }
     }
 
     private fun startEverything() {
@@ -174,7 +216,7 @@ class MainActivity : AppCompatActivity() {
         // 待机：只画不播
         if (standby) {
             overlay.drawBoxes = hits.map {
-                DrawBox(it.box, "${cn} ${it.direction}")
+                DrawBox(it.box, getString(R.string.box_label_no_dist, cn, it.direction))
             }
             frameHud("已找到${cn}，安静待命中",
                 getString(R.string.sub_standby), UiState.STANDBY)
@@ -196,7 +238,8 @@ class MainActivity : AppCompatActivity() {
 
             overlay.drawBoxes = shown.mapIndexed { i, h ->
                 DrawBox(h.box,
-                    "${cn} ${h.direction} ${"%.1f".format(h.dist)}米",
+                    getString(R.string.box_label, cn, h.direction,
+                        "%.1f".format(h.dist)),
                     i == nearIdx)
             }
             frameHud(
@@ -320,7 +363,7 @@ class MainActivity : AppCompatActivity() {
         lastSeenHit = null
         lastSeenTime = 0L
         tracker.reset()
-        updateHud("当前目标：$cn", getString(R.string.sub_searching),
+        updateHud(getString(R.string.sub_target, cn), getString(R.string.sub_searching),
             UiState.SEARCHING, holdMs = 2500L)
         speak("好的，现在帮你寻找$cn。请把手机摄像头对准前方，慢慢转动身体，我会告诉你它在哪里。")
     }
@@ -328,23 +371,46 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 语音播放 ----------------
     @Volatile private var currentPlayer: MediaPlayer? = null
 
-    private fun stopSpeaking() = ttsExecutor.execute {
+    /** 当前正在播放的临时文件。只在 [ttsExecutor] 这一个线程里读写。 */
+    private var currentTtsFile: File? = null
+
+    private fun stopSpeaking() = ttsExecutor.execute { releaseCurrentPlayer() }
+
+    /**
+     * 释放播放器**并删掉它的临时文件**，两件事必须成对做。
+     *
+     * 原先只在 `setOnCompletionListener` 里删文件，但播报被下一条打断时走的是
+     * `stop()` + `release()`，onCompletion 根本不会触发 —— 于是每被打断一次就
+     * 永久留下一个 wav。距离播报每 5 秒一条，长时间使用会一直堆在 cacheDir 里。
+     */
+    private fun releaseCurrentPlayer() {
         currentPlayer?.runCatching {
             if (isPlaying) stop()
             release()
         }
         currentPlayer = null
+        currentTtsFile?.delete()
+        currentTtsFile = null
+    }
+
+    /**
+     * 清掉上次运行残留的临时语音文件。cacheDir 跨进程存活，应用被系统杀掉时
+     * 来不及删的文件会一直留着，启动时统一扫一遍。
+     */
+    private fun cleanStaleTtsFiles() {
+        runCatching {
+            cacheDir.listFiles { f -> f.name.startsWith("tts_") && f.name.endsWith(".wav") }
+                ?.forEach { it.delete() }
+        }
     }
 
     private fun speak(text: String) {
+        if (voiceDisabled) return
         ttsExecutor.execute {
             val wav = api.synthesize(text) ?: return@execute
             if (ptt.isRecording) return@execute
             try {
-                currentPlayer?.runCatching {
-                    if (isPlaying) stop()
-                    release()
-                }
+                releaseCurrentPlayer()
                 val file = File(cacheDir, "tts_${ttsCounter++}.wav")
                 file.writeBytes(wav)
                 val player = MediaPlayer().apply {
@@ -354,14 +420,24 @@ class MainActivity : AppCompatActivity() {
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build())
                     setDataSource(file.absolutePath)
-                    setOnCompletionListener {
-                        it.release()
-                        file.delete()
-                        if (currentPlayer === it) currentPlayer = null
+                    // 回调在主线程，统一丢回 ttsExecutor，避免和 speak()/stopSpeaking()
+                    // 并发改 currentPlayer / currentTtsFile
+                    setOnCompletionListener { mp ->
+                        runCatching {
+                            ttsExecutor.execute {
+                                mp.release()
+                                file.delete()
+                                if (currentPlayer === mp) {
+                                    currentPlayer = null
+                                    currentTtsFile = null
+                                }
+                            }
+                        }
                     }
                     prepare()
                 }
                 currentPlayer = player
+                currentTtsFile = file
                 player.start()
             } catch (e: Exception) {
                 // 播放失败不影响主流程
@@ -383,6 +459,12 @@ class MainActivity : AppCompatActivity() {
 
     /** 临时提示的占位截止时间：在此之前不让每帧的状态刷新把它冲掉。 */
     @Volatile private var hudHoldUntil = 0L
+
+    /**
+     * 没有配置语音 Key。此时状态卡片要常驻错误提示 —— 否则启动后第一帧（约 30fps）
+     * 就会把它覆盖成"等待指令"，用户根本来不及看见。
+     */
+    private var voiceDisabled = false
 
     // 上一次真正写进控件的值。检测帧约 30fps，而 setText / setImageResource 每次都会
     // 触发重新测量或重新解析 VectorDrawable，内容没变就不该重复写。只在 UI 线程访问。
@@ -441,6 +523,8 @@ class MainActivity : AppCompatActivity() {
     private fun frameHud(
         text: String, sub: String, state: UiState, bearingAngle: Float = Float.NaN
     ) {
+        // 没配 Key 时状态卡片常驻错误提示，不被检测帧冲掉
+        if (voiceDisabled) return
         if (ptt.isRecording) return
         if (System.currentTimeMillis() < hudHoldUntil) return
         updateHud(text, sub, state, bearingAngle)
