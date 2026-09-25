@@ -49,22 +49,20 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # 必须缓存签名密钥，否则每次 CI 的产物都装不上上一版。
+      # 签名密钥固定在仓库里（android/keystore/sideload.jks），
+      # 不再依赖 Gradle 自动生成的 ~/.android/debug.keystore。
       #
-      # release 用的是 signingConfigs.getByName("debug")，而 debug keystore 由
-      # Gradle 在首次构建时自动生成到 ~/.android/debug.keystore。runner 是全新的，
-      # 不缓存就等于每次 CI 换一把新密钥 —— 实测第 4 轮和第 7 轮产物的证书摘要
-      # 完全不同（4cde784c… vs 05c12915…）。
-      # Android 要求覆盖安装时签名一致，签名一变系统就报"应用未安装"，
-      # 用户只能先卸载（应用数据全丢）再装新的。下载几轮 APK 一定会撞上。
+      # 之前 release 用的是 signingConfigs.getByName("debug")，而 debug keystore
+      # 由 Gradle 首次构建时随机生成，runner 又是全新机器 —— 于是每轮 CI 都换一把
+      # 新密钥。实测同一个提交 fc17252 连续构建，证书摘要依次是
+      # 4cde784c… / 05c12915… / b4456d77… / 7426bf8f…，而 APK 大小完全一样
+      # （46240722 字节），只有签名不同。
+      # Android 覆盖安装要求签名一致，签名一变系统就报"应用未安装"，
+      # 用户只能先卸载（应用数据全丢）再装新版。
       #
-      # key 用固定值（不带 SHA）：这样缓存跨提交长期复用，只在 GitHub 淘汰
-      # 缓存后才会重新生成一次密钥。
-      - name: 缓存调试签名密钥
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: android-debug-keystore-v1
+      # 也试过用 actions/cache 缓存 ~/.android/debug.keystore，但那个路径并不存在
+      # （日志报 "Path(s) ... do(es) not exist, hence no cache is being saved"），
+      # 而且缓存会被 GitHub 淘汰 —— 都不如把密钥放进仓库可靠。
 
       - name: 配置 Gradle 缓存
         uses: gradle/actions/setup-gradle@v4
@@ -74,25 +72,6 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
-
-      # 诊断：Gradle 把 debug.keystore 生成到哪里了。
-      # 第一版缓存写的是 ~/.android/debug.keystore，日志报
-      # "Path(s) ... do(es) not exist, hence no cache is being saved" ——
-      # 说明实际路径不是 $HOME/.android。定位后再把缓存路径改对。
-      - name: 定位签名密钥（诊断）
-        if: always()
-        run: |
-          echo "HOME=$HOME"
-          echo "ANDROID_SDK_HOME=${ANDROID_SDK_HOME:-未设置}"
-          echo "ANDROID_USER_HOME=${ANDROID_USER_HOME:-未设置}"
-          echo "ANDROID_PREFS_ROOT=${ANDROID_PREFS_ROOT:-未设置}"
-          for d in "$HOME/.android" "${ANDROID_SDK_HOME:-/nonexistent}/.android" \
-                   "${ANDROID_USER_HOME:-/nonexistent}"; do
-            echo "--- $d ---"
-            ls -la "$d" 2>/dev/null || echo "  (不存在)"
-          done
-          echo "--- find ---"
-          find "$HOME" /usr/local/lib/android /opt -name "debug.keystore" 2>/dev/null | head -10
 
       # 把产物改成带版本号和短 SHA 的名字，下载下来一眼能认出版本
       - name: 整理产物
@@ -106,15 +85,25 @@ jobs:
           cp "$src" "dist/$name"
           size=$(du -h "dist/$name" | cut -f1)
 
-          # 打印签名证书摘要：比对两次构建的这一行就能确认签名是否稳定。
-          # 摘要变了 = 覆盖安装会失败（系统报"应用未安装"），说明密钥缓存没生效。
-          # 整段用 if 包住，apksigner 找不到也不能让构建失败。
+          # 仓库内固定密钥的证书指纹。这一行每次构建都应该是同一个值；
+          # 对不上就说明签名配置没生效，覆盖安装会失败（系统报"应用未安装"）。
+          EXPECT="d376a48566801edd47a4206c0d28dd9b57ca6989eb58b880a67fa1882f5372b5"
           cert="未知"
           bt=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -n1 || true)
           if [ -n "$bt" ] && [ -x "$bt/apksigner" ]; then
             cert=$("$bt/apksigner" verify --print-certs "dist/$name" 2>/dev/null \
               | grep -m1 'SHA-256 digest' | sed 's/.*: //' || true)
             cert=${cert:-未知}
+          fi
+
+          # 找不到 apksigner 只告警，不让构建失败；但只要读到了证书，就必须对得上。
+          if [ "$cert" = "未知" ]; then
+            echo "::warning title=未能读取签名::没找到 apksigner，跳过签名校验"
+          elif [ "$cert" = "$EXPECT" ]; then
+            echo "签名证书与仓库内固定密钥一致"
+          else
+            echo "::error title=签名证书不一致::期望 ${EXPECT:0:16}…，实际 ${cert:0:16}…，覆盖安装会失败。"
+            exit 1
           fi
 
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -128,8 +117,8 @@ jobs:
           echo "| 提交 | \`$sha\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 签名证书 SHA-256 | \`${cert:0:16}…\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "> 安装新版本时若提示「应用未安装」，说明签名和已装的那份不一致 ——" >> "$GITHUB_STEP_SUMMARY"
-          echo "> 先卸载旧版再装。上面的证书摘要每次构建都应相同。" >> "$GITHUB_STEP_SUMMARY"
+          echo "> 签名固定用仓库内的 \`android/keystore/sideload.jks\`，各次构建一致，" >> "$GITHUB_STEP_SUMMARY"
+          echo "> 可以直接覆盖安装旧版本，不必先卸载。" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "在本页底部 **Artifacts** 区下载 \`EchoSight-apk\`。" >> "$GITHUB_STEP_SUMMARY"
 

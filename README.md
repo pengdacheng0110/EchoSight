@@ -67,16 +67,26 @@ py -c "from ultralytics import YOLO; [YOLO(f'models/{n}.pt') for n in ('yolo26n'
 
 打 `v*` 标签时（如 `git tag v1.0 && git push --tags`）会自动发 Release 并附上 APK。
 
-> **关于签名**：release 包用 Gradle 自动生成的 debug 密钥签名（`signingConfigs.getByName("debug")`），
-> 适合侧载自用。密钥文件 `~/.android/debug.keystore` 已在工作流里缓存，
-> 保证每次 CI 产物的签名一致 —— 否则新版本装不上旧版本，系统会报「应用未安装」，
-> 必须先卸载（应用数据全丢）再装。
-> 构建摘要里会打印**签名证书 SHA-256**，各次构建应当相同；变了就说明缓存没生效。
+> **关于签名**：release 包用仓库内自带的固定密钥签名
+> （`android/keystore/sideload.jks`，别名与口令都是 `echosight`）。
+> 这是**侧载测试用**的密钥，口令公开写在代码里，请勿用于上架。
 >
-> 若要上架应用商店，或想用固定密钥长期分发，需要换成正式密钥：
-> 生成一个 keystore，把它的 base64 和口令放进仓库 Secrets，再在
-> `android/app/build.gradle.kts` 里加一个 `release` signingConfig 读取它们。
-> **注意**：换正式密钥后无法覆盖 debug 签名装的版本，用户必须卸载重装。
+> 这一点必须说明白：早先 release 用的是 Gradle 自动生成的 debug 密钥
+> （`signingConfigs.getByName("debug")`），而它由 Gradle 首次构建时随机生成。
+> CI runner 每次都是全新机器，于是**每轮 CI 都换一把新密钥** —— 实测同一个提交
+> `fc17252` 连续构建，证书摘要依次是 `4cde784c…`、`05c12915…`、`b4456d77…`、
+> `7426bf8f…`，而 APK 大小一模一样（46240722 字节），只有签名不同。
+> Android 要求覆盖安装时签名一致，签名一变系统就报「应用未安装」，
+> 用户只能先卸载（应用数据全丢）再装新版。
+>
+> 密钥固定进仓库后，各次构建签名永远一致，既不依赖 CI 缓存、也不需要配 Secret。
+> 构建摘要里会打印**签名证书 SHA-256**，应恒为 `d376a485…5372b5`；
+> 对不上工作流会直接失败 —— 这是自动断言，不用人眼比对日志。
+>
+> 若要上架应用商店，请换一把自己的密钥，**并且不要把私钥提交进仓库**：
+> 生成 keystore 后把它的 base64 和口令放进仓库 Secrets，
+> 再在 `android/app/build.gradle.kts` 里加一个 signingConfig 读取它们。
+> **注意**：换密钥后无法覆盖当前签名的版本，用户必须卸载重装。
 
 ### 界面说明
 
