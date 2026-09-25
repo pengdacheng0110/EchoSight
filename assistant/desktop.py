@@ -129,6 +129,7 @@ class DesktopApp:
         # （摄像头被拔、推理报错、Ctrl+C），监听线程不会停、摄像头不会 release ——
         # 进程里留一条一直在读麦克风的线程，而且下次运行直接报"无法打开摄像头"。
         cap = cv2.VideoCapture(0)
+        error = None
         try:
             if not cap.isOpened():
                 raise RuntimeError("无法打开摄像头")
@@ -137,12 +138,26 @@ class DesktopApp:
             # 测距器持有跨帧的滤波状态，整个扫描过程复用同一个实例
             estimator = DistanceEstimator(frame_w, frame_h)
             self._scan_loop(cap, estimator)
+        except Exception as e:
+            error = e
+            print(f"[异常] 扫描中止：{type(e).__name__}: {e}")
         finally:
             if self.listener:
                 self.listener.stop()
             cap.release()
             cv2.destroyAllWindows()
-        speak("已退出，再见。", wait=True)
+            self.detector.stop()
+
+            # 道别播报必须放在 finally 里。
+            # 原先这句写在 try/finally **之后**，于是只有正常退出才念得出来；
+            # 摄像头打不开、推理线程死掉这类异常退出，程序是**一声不吭地消失**的。
+            # 盲人用户看不见 traceback，只会觉得语音助手突然不说话了 ——
+            # 既不知道出了什么事，也不知道该不该重开。
+            if error is None:
+                speak("已退出，再见。", wait=True)
+            else:
+                reason = str(error)[:60]
+                speak(f"程序出错了，即将退出。{reason}", wait=True)
 
     def _scan_loop(self, cap, estimator):
         search_start = time.time()
@@ -156,6 +171,14 @@ class DesktopApp:
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # 推理线程死了就必须立刻停。
+            # 继续跑下去，detector.latest() 会一直返回最后一帧的陈旧框 ——
+            # 于是画面和播报会**稳定地**报一个早就不成立的位置，看上去一切正常。
+            # 宁可中止并出声，也不能让用户按错信息行动。
+            if not self.detector.alive:
+                raise RuntimeError(
+                    f"检测线程已停止（{self.detector.fatal_error}）")
 
             self.detector.submit(frame)
             now = time.time()

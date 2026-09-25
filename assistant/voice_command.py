@@ -102,35 +102,46 @@ class VoiceListener:
         return audio if length >= _min_len else None
 
     def _run(self):
-        with sd.InputStream(samplerate=config.SAMPLE_RATE, channels=1,
-                            dtype="int16", blocksize=_block_frames) as stream:
-            self._calibrate(stream)
-            loud = 0
-            pending = []
-            while self.active:
-                b, overflowed = stream.read(_block_frames)
-                if overflowed:
-                    print("[监听] 音频缓冲溢出（建议关闭占CPU的程序）")
-                x = b[:, 0]
-                if self._rms(x) >= self.threshold:
-                    loud += 1
-                    pending.append(x)
-                    if loud == _start_blocks:
-                        # 确认说话开始；屏蔽期间直接丢弃，不进入识别
-                        if self._muted.is_set():
-                            loud, pending = 0, []
-                            continue
-                        audio = self._record_utterance(stream, pending)
-                        loud, pending = 0, []
-                        if audio is not None:
-                            self._handle(audio)
-                else:
-                    if loud > 0:
-                        # 说话前的短停顿，先缓存可能是开头的部分
+        # 整段兜异常。
+        # sd 的流在设备中途断开时（拔掉 USB 耳机/麦克风、被其他程序独占）会抛
+        # PortAudioError；而这是**全语音操作**的应用，监听线程一死，语音指令就
+        # 彻底失灵，偏偏 self.active 还停在 True，没有任何地方会发现。
+        # 至少要把状态同步过去，并留下一条看得懂的日志。
+        try:
+            with sd.InputStream(samplerate=config.SAMPLE_RATE, channels=1,
+                                dtype="int16",
+                                blocksize=_block_frames) as stream:
+                self._calibrate(stream)
+                loud = 0
+                pending = []
+                while self.active:
+                    b, overflowed = stream.read(_block_frames)
+                    if overflowed:
+                        print("[监听] 音频缓冲溢出（建议关闭占CPU的程序）")
+                    x = b[:, 0]
+                    if self._rms(x) >= self.threshold:
+                        loud += 1
                         pending.append(x)
-                    loud = 0
-                    if len(pending) > _start_blocks + _end_blocks:
-                        pending = pending[-_start_blocks:]
+                        if loud == _start_blocks:
+                            # 确认说话开始；屏蔽期间直接丢弃，不进入识别
+                            if self._muted.is_set():
+                                loud, pending = 0, []
+                                continue
+                            audio = self._record_utterance(stream, pending)
+                            loud, pending = 0, []
+                            if audio is not None:
+                                self._handle(audio)
+                    else:
+                        if loud > 0:
+                            # 说话前的短停顿，先缓存可能是开头的部分
+                            pending.append(x)
+                        loud = 0
+                        if len(pending) > _start_blocks + _end_blocks:
+                            pending = pending[-_start_blocks:]
+        except Exception as e:
+            self.active = False
+            print(f"[监听] 线程异常退出，语音控制已失效："
+                  f"{type(e).__name__}: {e}")
 
     def _handle(self, audio):
         import io
