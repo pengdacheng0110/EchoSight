@@ -49,6 +49,23 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # 必须缓存签名密钥，否则每次 CI 的产物都装不上上一版。
+      #
+      # release 用的是 signingConfigs.getByName("debug")，而 debug keystore 由
+      # Gradle 在首次构建时自动生成到 ~/.android/debug.keystore。runner 是全新的，
+      # 不缓存就等于每次 CI 换一把新密钥 —— 实测第 4 轮和第 7 轮产物的证书摘要
+      # 完全不同（4cde784c… vs 05c12915…）。
+      # Android 要求覆盖安装时签名一致，签名一变系统就报"应用未安装"，
+      # 用户只能先卸载（应用数据全丢）再装新的。下载几轮 APK 一定会撞上。
+      #
+      # key 用固定值（不带 SHA）：这样缓存跨提交长期复用，只在 GitHub 淘汰
+      # 缓存后才会重新生成一次密钥。
+      - name: 缓存调试签名密钥
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
       - name: 配置 Gradle 缓存
         uses: gradle/actions/setup-gradle@v4
 
@@ -69,6 +86,18 @@ jobs:
           name="EchoSight-${sha}.apk"
           cp "$src" "dist/$name"
           size=$(du -h "dist/$name" | cut -f1)
+
+          # 打印签名证书摘要：比对两次构建的这一行就能确认签名是否稳定。
+          # 摘要变了 = 覆盖安装会失败（系统报"应用未安装"），说明密钥缓存没生效。
+          # 整段用 if 包住，apksigner 找不到也不能让构建失败。
+          cert="未知"
+          bt=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/* 2>/dev/null | sort -V | tail -n1 || true)
+          if [ -n "$bt" ] && [ -x "$bt/apksigner" ]; then
+            cert=$("$bt/apksigner" verify --print-certs "dist/$name" 2>/dev/null \
+              | grep -m1 'SHA-256 digest' | sed 's/.*: //' || true)
+            cert=${cert:-未知}
+          fi
+
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "size=$size" >> "$GITHUB_OUTPUT"
           echo "### ✅ 打包成功" >> "$GITHUB_STEP_SUMMARY"
@@ -78,6 +107,10 @@ jobs:
           echo "| 文件 | \`$name\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 大小 | $size |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 提交 | \`$sha\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 签名证书 SHA-256 | \`${cert:0:16}…\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> 安装新版本时若提示「应用未安装」，说明签名和已装的那份不一致 ——" >> "$GITHUB_STEP_SUMMARY"
+          echo "> 先卸载旧版再装。上面的证书摘要每次构建都应相同。" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "在本页底部 **Artifacts** 区下载 \`EchoSight-apk\`。" >> "$GITHUB_STEP_SUMMARY"
 
