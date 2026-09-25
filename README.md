@@ -67,6 +67,17 @@ py -c "from ultralytics import YOLO; [YOLO(f'models/{n}.pt') for n in ('yolo26n'
 
 打 `v*` 标签时（如 `git tag v1.0 && git push --tags`）会自动发 Release 并附上 APK。
 
+> **关于签名**：release 包用 Gradle 自动生成的 debug 密钥签名（`signingConfigs.getByName("debug")`），
+> 适合侧载自用。密钥文件 `~/.android/debug.keystore` 已在工作流里缓存，
+> 保证每次 CI 产物的签名一致 —— 否则新版本装不上旧版本，系统会报「应用未安装」，
+> 必须先卸载（应用数据全丢）再装。
+> 构建摘要里会打印**签名证书 SHA-256**，各次构建应当相同；变了就说明缓存没生效。
+>
+> 若要上架应用商店，或想用固定密钥长期分发，需要换成正式密钥：
+> 生成一个 keystore，把它的 base64 和口令放进仓库 Secrets，再在
+> `android/app/build.gradle.kts` 里加一个 `release` signingConfig 读取它们。
+> **注意**：换正式密钥后无法覆盖 debug 签名装的版本，用户必须卸载重装。
+
 ### 界面说明
 
 界面是给**低视力用户和陪行的人**看的辅助通道，语音仍是主通道。

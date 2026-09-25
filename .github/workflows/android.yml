@@ -75,6 +75,25 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
+      # 诊断：Gradle 把 debug.keystore 生成到哪里了。
+      # 第一版缓存写的是 ~/.android/debug.keystore，日志报
+      # "Path(s) ... do(es) not exist, hence no cache is being saved" ——
+      # 说明实际路径不是 $HOME/.android。定位后再把缓存路径改对。
+      - name: 定位签名密钥（诊断）
+        if: always()
+        run: |
+          echo "HOME=$HOME"
+          echo "ANDROID_SDK_HOME=${ANDROID_SDK_HOME:-未设置}"
+          echo "ANDROID_USER_HOME=${ANDROID_USER_HOME:-未设置}"
+          echo "ANDROID_PREFS_ROOT=${ANDROID_PREFS_ROOT:-未设置}"
+          for d in "$HOME/.android" "${ANDROID_SDK_HOME:-/nonexistent}/.android" \
+                   "${ANDROID_USER_HOME:-/nonexistent}"; do
+            echo "--- $d ---"
+            ls -la "$d" 2>/dev/null || echo "  (不存在)"
+          done
+          echo "--- find ---"
+          find "$HOME" /usr/local/lib/android /opt -name "debug.keystore" 2>/dev/null | head -10
+
       # 把产物改成带版本号和短 SHA 的名字，下载下来一眼能认出版本
       - name: 整理产物
         id: apk
