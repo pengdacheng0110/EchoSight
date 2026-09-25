@@ -23,31 +23,36 @@ import time
 
 print("实时检测已启动，按 Q 键退出...")
 prev = time.time()
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+# 收尾必须放进 finally。原先 cap.release() / destroyAllWindows() 直接跟在循环
+# 后面，循环里一旦抛异常（推理报错、画面尺寸突变、Ctrl+C），这两行就走不到 ——
+# 进程里一直占着摄像头设备，再跑一次直接报"无法打开摄像头"。
+# assistant/desktop.py 里同一个坑已经修过，这里保持一致。
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    # 流式推理（verbose=False 关闭终端刷屏）
-    results = model(frame, conf=0.3, verbose=False)  # 降低阈值减少漏检
-    annotated = results[0].plot()
+        # 流式推理（verbose=False 关闭终端刷屏）
+        results = model(frame, conf=0.3, verbose=False)  # 降低阈值减少漏检
+        annotated = results[0].plot()
 
-    # 计算实时帧率
-    now = time.time()
-    fps = 1 / (now - prev)
-    prev = now
+        # 计算实时帧率
+        now = time.time()
+        fps = 1 / (now - prev)
+        prev = now
 
-    # 左上角显示检测到的物体名称和帧率
-    names = [model.names[int(b.cls[0])] for b in results[0].boxes]
-    label = ", ".join(sorted(set(names)))
-    cv2.putText(annotated, label, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # 左上角显示检测到的物体名称和帧率
+        names = [model.names[int(b.cls[0])] for b in results[0].boxes]
+        label = ", ".join(sorted(set(names)))
+        cv2.putText(annotated, label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    cv2.imshow("YOLO26x Realtime - Press Q to quit", annotated)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+        cv2.imshow("YOLO26x Realtime - Press Q to quit", annotated)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
