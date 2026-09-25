@@ -62,7 +62,7 @@ def report(samples, frame_w):
           f"{config.FX_FACTOR}）")
     print(f"竖直角 fy          ≈ {fx:.1f} px（像素为正方形时 fy = fx）")
     print("=" * 56)
-    return fx, fx / w
+    return fx, fx / w, w
 
 
 def offline(args):
@@ -89,7 +89,9 @@ def camera(args):
 
     if args.klass:
         en = args.klass
-        real_h = REAL_HEIGHT[en]
+        real_h = REAL_HEIGHT.get(en)
+        if real_h is None:
+            sys.exit(f"未知类别 {en}，可选示例：person / chair / car")
         if not height_trust(en):
             print(f"提示：{CLASS_CN[en]} 的高度先验可信度较低，"
                   f"标定结果可能偏差较大，建议换 person / chair 这类物体。")
@@ -106,7 +108,12 @@ def camera(args):
           f"把 {CLASS_CN[en]} 放在 {args.distance} 米处，"
           f"按空格采样，按 Q 结束。")
 
-    cid = next(k for k, v in det.model.names.items() if v == en)
+    # 与 desktop.DesktopApp._class_id 保持同一写法。
+    # 没有默认值的 next() 在匹配不到时抛 StopIteration；换了自定义权重、
+    # 模型标签和 COCO 不一致时这里就会崩，而且崩得莫名其妙。
+    cid = next((k for k, v in det.model.names.items() if v == en), None)
+    if cid is None:
+        sys.exit(f"模型标签里没有 {en}，无法标定（该模型可能不是 COCO 80 类）。")
     samples = []
     while True:
         ret, frame = cap.read()
@@ -144,7 +151,7 @@ def camera(args):
     return report(samples, frame_w)
 
 
-def write_config(factor, fx):
+def write_config(factor, fx, frame_w):
     """把标定结果写回 config.py。只替换 FX_FACTOR 一行，其余内容不动。"""
     path = ROOT / "assistant" / "config.py"
     src = path.read_text(encoding="utf-8")
@@ -155,8 +162,11 @@ def write_config(factor, fx):
         sys.exit("没找到 FX_FACTOR 那一行，未修改文件。")
     path.write_text(new, encoding="utf-8")
     print(f"已写回 {path}")
+    # 这里必须用**本次标定的真实画面宽**，不能用 IMAGE_W_FALLBACK(640) ——
+    # FX_FACTOR 是 fx/画面宽，换一个宽度的相机这个数就不一样了，
+    # 写死 640 会让这行提示在 1280 宽的摄像头上直接算错。
     print(f"  FX_FACTOR = {factor:.4f}   (fx = {fx:.1f} px @ 画面宽 "
-          f"{config.IMAGE_W_FALLBACK})")
+          f"{frame_w:.0f})")
 
 
 def main():
@@ -179,12 +189,12 @@ def main():
         sys.exit("必须用 --distance 指定实测距离（米）")
 
     if args.height_px is not None:
-        fx, factor = offline(args)
+        fx, factor, frame_w = offline(args)
     else:
-        fx, factor = camera(args)
+        fx, factor, frame_w = camera(args)
 
     if args.write:
-        write_config(factor, fx)
+        write_config(factor, fx, frame_w)
 
 
 if __name__ == "__main__":
