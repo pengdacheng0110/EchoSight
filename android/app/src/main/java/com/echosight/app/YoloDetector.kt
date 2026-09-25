@@ -21,10 +21,15 @@ data class DetBox(
     val cls: Int, val conf: Float
 )
 
-class YoloDetector(context: Context) {
+class YoloDetector(context: Context) : AutoCloseable {
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
+    /** 建会话用的选项。也是原生资源，用完不关会一直占着，交给 close() 统一释放。 */
+    private val opts = OrtSession.SessionOptions().apply {
+        setIntraOpNumThreads(4)
+        setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+    }
     private val inputName: String
 
     private val inputSize = 320
@@ -48,12 +53,23 @@ class YoloDetector(context: Context) {
 
     init {
         val bytes = context.assets.open("yolo26n.onnx").use { it.readBytes() }
-        val opts = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(4)
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        }
         session = env.createSession(bytes, opts)
         inputName = session.inputNames.first()
+    }
+
+    /**
+     * 释放 ONNX 会话占的原生内存。
+     *
+     * [OrtSession] 装的是模型本体加运行时缓冲（这个模型约 10MB），GC 完全管不到 ——
+     * 不显式 close，Activity 每重建一次（切语言、切深色模式、分屏尺寸变化）就会再建
+     * 一个，旧的永远不释放。原先这里连 close 方法都没有，MainActivity.onDestroy
+     * 也没有任何释放动作。
+     *
+     * 注意 `OrtEnvironment` 是**进程级单例**，不能在这里关掉，关了后续再建会话会崩。
+     */
+    override fun close() {
+        runCatching { session.close() }
+        runCatching { opts.close() }
     }
 
     /** 相机帧（YUV）→ 转正 Bitmap → 推理；返回框坐标基于转正后画面。 */
@@ -114,42 +130,55 @@ class YoloDetector(context: Context) {
         }
 
         // 输出 [1, 84, 2100]：直接从 OnnxTensor 的 FloatBuffer 按索引读取
-        //（布局为 CHW，索引 = c*2100+i），避免转成 Java 多维数组
-        val outTensor = output.get(0) as OnnxTensor
-        val fb = outTensor.floatBuffer
-        val anchors = fb.capacity() / 84      // 2100
-        val raw = ArrayList<DetBox>()
-        for (i in 0 until anchors) {
-            var bestScore = confThreshold
-            var bestCls = -1
-            for (c in 0 until 80) {
-                val s = fb.get(4 * anchors + c * anchors + i)
-                if (s > bestScore) {
-                    bestScore = s
-                    bestCls = c
+        //（布局为 CHW，索引 = c*2100+i），避免转成 Java 多维数组。
+        //
+        // 这一整段必须 try/finally：上面输入张量已经用 use 包住了，输出这边同理 ——
+        // 中间任何一步抛异常（模型输出布局一变，`get(0) as OnnxTensor` 就会强转失败
+        // 或越界），原先裸写的 outTensor.close() / output.close() 直接被跳过，
+        // 每帧漏一份原生内存，30fps 下几秒钟就吃光。
+        var outTensor: OnnxTensor? = null
+        try {
+            val ot = output.get(0) as OnnxTensor
+            outTensor = ot
+            val fb = ot.floatBuffer
+            val anchors = fb.capacity() / 84      // 2100
+            val raw = ArrayList<DetBox>()
+            for (i in 0 until anchors) {
+                var bestScore = confThreshold
+                var bestCls = -1
+                for (c in 0 until 80) {
+                    val s = fb.get(4 * anchors + c * anchors + i)
+                    if (s > bestScore) {
+                        bestScore = s
+                        bestCls = c
+                    }
                 }
-            }
-            if (bestCls < 0) continue
-            val cx = fb.get(i)
-            val cy = fb.get(anchors + i)
-            val bw = fb.get(2 * anchors + i)
-            val bh = fb.get(3 * anchors + i)
+                if (bestCls < 0) continue
+                val cx = fb.get(i)
+                val cy = fb.get(anchors + i)
+                val bw = fb.get(2 * anchors + i)
+                val bh = fb.get(3 * anchors + i)
 
-            // 反 letterbox 到原画面坐标
-            val x1 = (cx - bw / 2 - padX) / scale
-            val y1 = (cy - bh / 2 - padY) / scale
-            val x2 = (cx + bw / 2 - padX) / scale
-            val y2 = (cy + bh / 2 - padY) / scale
-            raw.add(DetBox(
-                x1.coerceIn(0f, w.toFloat()),
-                y1.coerceIn(0f, h.toFloat()),
-                x2.coerceIn(0f, w.toFloat()),
-                y2.coerceIn(0f, h.toFloat()),
-                bestCls, bestScore))
+                // 反 letterbox 到原画面坐标
+                val x1 = (cx - bw / 2 - padX) / scale
+                val y1 = (cy - bh / 2 - padY) / scale
+                val x2 = (cx + bw / 2 - padX) / scale
+                val y2 = (cy + bh / 2 - padY) / scale
+                raw.add(DetBox(
+                    x1.coerceIn(0f, w.toFloat()),
+                    y1.coerceIn(0f, h.toFloat()),
+                    x2.coerceIn(0f, w.toFloat()),
+                    y2.coerceIn(0f, h.toFloat()),
+                    bestCls, bestScore))
+            }
+            return nms(raw)
+        } finally {
+            // 顺序与原先一致：先关输出张量，再关 Result。
+            // Result.close() 也会去关它持有的张量，所以两次都包 runCatching，
+            // 重复关闭不会抛出去把检测线程打断。
+            outTensor?.let { runCatching { it.close() } }
+            runCatching { output.close() }
         }
-        outTensor.close()
-        output.close()
-        return nms(raw)
     }
 
     private fun nms(boxes: List<DetBox>): List<DetBox> {

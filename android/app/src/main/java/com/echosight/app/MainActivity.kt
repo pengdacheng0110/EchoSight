@@ -387,8 +387,21 @@ class MainActivity : AppCompatActivity() {
     // ---------------- 语音播放 ----------------
     @Volatile private var currentPlayer: MediaPlayer? = null
 
-    /** 当前正在播放的临时文件。只在 [ttsExecutor] 这一个线程里读写。 */
-    private var currentTtsFile: File? = null
+    /**
+     * 当前正在播放的临时文件。只在 [ttsExecutor] 这一个线程里读写 ——
+     * 唯一的例外是 onDestroy 里的同步收尾，所以标 @Volatile。
+     */
+    @Volatile private var currentTtsFile: File? = null
+
+    /**
+     * 已进入销毁流程。
+     *
+     * 播报线程可能正卡在 synthesize() 的网络请求里（读超时 30 秒），
+     * `shutdownNow()` 只是打断等待、并不能取消那个阻塞调用 —— 它拿到结果后
+     * 还会继续往下走。有这个标记，它才会在建播放器之前停手，
+     * 否则主线程刚收完尾，它又 new 一个 MediaPlayer 出来，照样漏。
+     */
+    @Volatile private var ttsStopped = false
 
     private fun stopSpeaking() = ttsExecutor.execute { releaseCurrentPlayer() }
 
@@ -421,10 +434,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun speak(text: String) {
-        if (voiceDisabled) return
+        if (voiceDisabled || ttsStopped) return
         ttsExecutor.execute {
             val wav = api.synthesize(text) ?: return@execute
-            if (ptt.isRecording) return@execute
+            // synthesize() 是阻塞的网络请求，shutdownNow() 打断不了它，
+            // 所以拿到结果之后必须再看一眼是否已经进入销毁流程。
+            if (ptt.isRecording || ttsStopped) return@execute
             try {
                 releaseCurrentPlayer()
                 val file = File(cacheDir, "tts_${ttsCounter++}.wav")
@@ -557,8 +572,24 @@ class MainActivity : AppCompatActivity() {
         // release() 是同步的，不像 stopSpeaking() 那样要排进线程池 ——
         // 下面紧跟着 shutdownNow()，排进去的任务会被直接丢弃，等于没写。
         ptt.release()
+
+        // 同一个道理，上面那句注释没管到的另一半：正在播放的 MediaPlayer 和它的
+        // 临时 wav，原先只靠 stopSpeaking() 排进 ttsExecutor 去释放，而这里紧接着
+        // 就 shutdownNow() 把排队任务丢掉了 —— 于是销毁时正在播报的那份谁都不管。
+        // 先立标记挡住还没开始的播报，再中断线程，最后在主线程同步收尾。
+        ttsStopped = true
         ttsExecutor.shutdownNow()
-        analysisExecutor.shutdownNow()
+        releaseCurrentPlayer()
+
+        // ONNX 会话占的是原生内存（模型本体加运行时缓冲，约 10MB），GC 管不到，
+        // 原先没有任何地方释放它 —— Activity 每次重建都会再建一个。
+        // 关闭动作必须排在检测线程自己身上，不能在主线程直接关：万一还有一帧
+        // 卡在 session.run 里，那就是在释放正在使用的原生句柄，会直接崩。
+        // 这里用 shutdown() 而不是 shutdownNow()，后者会把关闭任务本身丢掉。
+        if (::detector.isInitialized) {
+            runCatching { analysisExecutor.execute { detector.close() } }
+        }
+        analysisExecutor.shutdown()
     }
 
     companion object {
