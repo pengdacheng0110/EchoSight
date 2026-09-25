@@ -5,8 +5,13 @@
 ## 运行
 
 ```powershell
-py blind_assistant.py        # 或双击 run.bat
+py -m venv buildenv                              # 建议：建一个项目内虚拟环境
+buildenv\Scripts\pip install -r requirements.txt
+buildenv\Scripts\python blind_assistant.py       # 或双击 run.bat
 ```
+
+`run.bat` 会依次找 `buildenv\Scripts\python.exe` → `py` → `python`，用第一个能用的，
+所以不建虚拟环境、直接用系统 Python 也能双击运行（依赖需装在系统 Python 里）。
 
 API Key 读取顺序：环境变量 `SENSEAUDIO_API_KEY` → 根目录 `.api_key` 文件（写入 `sk-` 开头的 Key，已 gitignore）。
 
