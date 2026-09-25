@@ -144,43 +144,95 @@ class PushToTalk {
     private var recorder: AudioRecord? = null
     @Volatile private var recording = false
     private var pcmOut = ByteArrayOutputStream()
+
+    /**
+     * 保护 [pcmOut] 的锁。
+     *
+     * 不要直接写 `synchronized(pcmOut)` —— pcmOut 是个会被重新赋值的字段，
+     * 锁一个非 final 字段意味着两个线程可能锁在不同对象上，等于没锁。
+     */
+    private val lock = Any()
     private var thread: Thread? = null
 
     val isRecording get() = recording
 
+    /**
+     * 开始录音。
+     *
+     * @return 是否真的进入了录音状态。麦克风被别的应用占用、或参数不被支持时
+     *         会返回 false —— 原先这里直接调 startRecording()，
+     *         设备处于 STATE_UNINITIALIZED 时会抛 IllegalStateException 把应用打崩。
+     */
     @SuppressLint("MissingPermission")
-    fun start() {
-        if (recording) return
+    fun start(): Boolean {
+        if (recording) return false
         val minBuf = AudioRecord.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT)
         val bufSize = maxOf(minBuf, sampleRate * 2) // 至少2秒缓冲
-        val rec = AudioRecord(
-            MediaRecorder.AudioSource.MIC, sampleRate,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            bufSize)
+        val rec = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.MIC, sampleRate,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                bufSize)
+        } catch (e: Exception) {
+            Log.w(TAG, "创建 AudioRecord 失败: $e")
+            return false
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            Log.w(TAG, "AudioRecord 未初始化（麦克风可能被占用），放弃录音")
+            rec.runCatching { release() }
+            return false
+        }
         recorder = rec
-        pcmOut = ByteArrayOutputStream()
+        synchronized(lock) { pcmOut = ByteArrayOutputStream() }
+        try {
+            rec.startRecording()
+        } catch (e: Exception) {
+            Log.w(TAG, "startRecording 失败: $e")
+            rec.runCatching { release() }
+            recorder = null
+            return false
+        }
         recording = true
-        rec.startRecording()
         thread = Thread {
             val buf = ByteArray(3200)
             while (recording) {
-                val n = rec.read(buf, 0, buf.size)
-                if (n > 0) synchronized(pcmOut) { pcmOut.write(buf, 0, n) }
+                val n = try {
+                    rec.read(buf, 0, buf.size)
+                } catch (e: Exception) {
+                    break
+                }
+                if (n > 0) synchronized(lock) { pcmOut.write(buf, 0, n) }
             }
         }.also { it.start() }
+        return true
     }
 
-    /** 停止并返回 wav 字节。 */
+    /** 停止并返回 wav 字节；没有在录则返回空数组。 */
     fun stop(): ByteArray {
         if (!recording) return ByteArray(0)
+        teardown()
+        val pcm = synchronized(lock) { pcmOut.toByteArray() }
+        return VoiceApi.pcmToWav(pcm, sampleRate)
+    }
+
+    /**
+     * 只释放不取数据，供 onDestroy 兜底。
+     * 不释放的话麦克风会一直被占着，别的应用录不了音。
+     */
+    fun release() = teardown()
+
+    private fun teardown() {
         recording = false
         thread?.join(1000)
+        thread = null
         recorder?.runCatching { stop() }
         recorder?.runCatching { release() }
         recorder = null
-        val pcm = synchronized(pcmOut) { pcmOut.toByteArray() }
-        return VoiceApi.pcmToWav(pcm, sampleRate)
+    }
+
+    private companion object {
+        const val TAG = "PushToTalk"
     }
 }

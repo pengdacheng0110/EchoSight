@@ -6,6 +6,7 @@
     <string name="status_starting">正在启动…</string>
     <string name="status_need_permission">需要相机和麦克风权限才能使用，点这里重新授权</string>
     <string name="status_no_key">未配置语音接口 Key，语音功能不可用</string>
+    <string name="status_mic_busy">无法开始录音，请检查是否有其他应用正在占用麦克风</string>
 
     <!-- 状态副标题 -->
     <string name="sub_no_target">尚未选择目标物品</string>

@@ -31,13 +31,20 @@ class YoloDetector(context: Context) {
     private val confThreshold = 0.3f
     private val iouThreshold = 0.45f
 
-    // 复用的中间缓冲
+    // 复用的中间缓冲。这些数组每帧都会用，且尺寸固定（或只随相机配置变一次），
+    // 绝不能每帧新建 —— 实测 argb + pixels 加起来约 1.56MB/帧，30fps 就是 47MB/s
+    // 的垃圾，在实时检测里会引发 GC 停顿和掉帧。
+    // 全部只在 analysisExecutor 这一个线程上访问，不需要加锁。
     private val inputData = FloatArray(3 * inputSize * inputSize)
     private val letterboxBitmap =
         Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
     private val letterboxCanvas = Canvas(letterboxBitmap)
     private val blackPaint = Paint().apply { color = Color.BLACK }
     private val tmpTransform = Matrix()
+    /** letterbox 后的像素，固定 320×320。 */
+    private val letterboxPixels = IntArray(inputSize * inputSize)
+    /** YUV→ARGB 的中间数组，尺寸随帧变化，只在变化时重建。 */
+    private var argbPixels = IntArray(0)
 
     init {
         val bytes = context.assets.open("yolo26n.onnx").use { it.readBytes() }
@@ -88,24 +95,23 @@ class YoloDetector(context: Context) {
         letterboxCanvas.drawBitmap(bitmap, tmpTransform, null)
 
         // Bitmap(ARGB) → CHW float, /255
-        val pixels = IntArray(inputSize * inputSize)
-        letterboxBitmap.getPixels(pixels, 0, inputSize, 0, 0,
+        letterboxBitmap.getPixels(letterboxPixels, 0, inputSize, 0, 0,
             inputSize, inputSize)
         val plane = inputSize * inputSize
-        var idx = 0
         for (i in 0 until plane) {
-            val c = pixels[i]
+            val c = letterboxPixels[i]
             inputData[i] = ((c shr 16) and 0xFF) / 255f
             inputData[plane + i] = ((c shr 8) and 0xFF) / 255f
             inputData[2 * plane + i] = (c and 0xFF) / 255f
-            idx++
         }
 
         val shape = longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
-        val tensor = OnnxTensor.createTensor(
-            env, FloatBuffer.wrap(inputData), shape)
-        val output = session.run(Collections.singletonMap(inputName, tensor))
-        tensor.close()
+        // tensor 必须用 use 包住：session.run 抛异常时若不释放，
+        // 每帧漏一份原生内存，模型一出错就会快速吃光。
+        val output = OnnxTensor.createTensor(
+            env, FloatBuffer.wrap(inputData), shape).use { tensor ->
+            session.run(Collections.singletonMap(inputName, tensor))
+        }
 
         // 输出 [1, 84, 2100]：直接从 OnnxTensor 的 FloatBuffer 按索引读取
         //（布局为 CHW，索引 = c*2100+i），避免转成 Java 多维数组
@@ -188,7 +194,11 @@ class YoloDetector(context: Context) {
         val uvRowStride = uPlane.rowStride
         val uvPixelStride = uPlane.pixelStride
 
-        val argb = IntArray(width * height)
+        // 复用同一个数组，只在相机分辨率变化时重建一次。
+        // Bitmap.setPixels 是拷贝，复用不会串帧。
+        val need = width * height
+        if (argbPixels.size != need) argbPixels = IntArray(need)
+        val argb = argbPixels
         for (row in 0 until height) {
             val top = row * width
             val uvRowPos = uvRowStride * (row / 2)

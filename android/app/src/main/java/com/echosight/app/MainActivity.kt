@@ -51,6 +51,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var detector: YoloDetector
     private val api = VoiceApi(BuildConfig.SENSEAUDIO_KEY)
     private val ptt = PushToTalk()
+
+    /** 本次按下是否真的进入了录音态。麦克风被占用时 start() 会失败。 */
+    private var pttActive = false
     private val ttsExecutor = Executors.newSingleThreadExecutor()
     private val analysisExecutor = Executors.newSingleThreadExecutor()
 
@@ -283,17 +286,30 @@ class MainActivity : AppCompatActivity() {
                 MotionEvent.ACTION_DOWN -> {
                     v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     stopSpeaking()
-                    ptt.start()
-                    setRecordingUi(true)
+                    pttActive = ptt.start()
+                    if (pttActive) {
+                        setRecordingUi(true)
+                    } else {
+                        // 麦克风被占用时 start() 会失败（不再抛异常打崩应用），
+                        // 这里把原因说出来，别让用户对着一个没反应的按钮干按。
+                        updateHud(getString(R.string.status_mic_busy),
+                            getString(R.string.sub_searching), UiState.ERROR,
+                            holdMs = 3000L)
+                        speak(getString(R.string.status_mic_busy))
+                    }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    val wasActive = pttActive
+                    pttActive = false
                     val wav = ptt.stop()
-                    setRecordingUi(false)
-                    if (event.action == MotionEvent.ACTION_UP && wav.size > 1000) {
+                    // 只有真的进过录音态才动 UI：否则会把上面那条错误提示
+                    // 的占位时间一起清掉（setRecordingUi(false) 会重置 hudHoldUntil）
+                    if (wasActive) setRecordingUi(false)
+                    if (event.action == MotionEvent.ACTION_UP && wasActive && wav.size > 1000) {
                         sendForAsr(wav)
-                    } else if (event.action == MotionEvent.ACTION_UP) {
+                    } else if (event.action == MotionEvent.ACTION_UP && wasActive) {
                         updateHud("说话时间太短了，请按住按钮多说一会儿。",
                             getString(R.string.sub_searching), UiState.SEARCHING,
                             holdMs = 2500L)
@@ -537,6 +553,10 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         if (::tilt.isInitialized) tilt.stop()
+        // 兜底释放麦克风：销毁时若还占着 AudioRecord，别的应用会录不了音。
+        // release() 是同步的，不像 stopSpeaking() 那样要排进线程池 ——
+        // 下面紧跟着 shutdownNow()，排进去的任务会被直接丢弃，等于没写。
+        ptt.release()
         ttsExecutor.shutdownNow()
         analysisExecutor.shutdownNow()
     }
