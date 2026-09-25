@@ -13,6 +13,7 @@ _speech_q = queue.Queue()
 def _speech_worker():
     while True:
         text, done = _speech_q.get()
+        muted = False
         try:
             audio = synthesize(text)
             if audio:
@@ -20,11 +21,23 @@ def _speech_worker():
                     f.write(audio)
                 if _on_play_start:
                     _on_play_start()
+                    muted = True
                 winsound.PlaySound(str(config.TMP_WAV),
                                    winsound.SND_FILENAME)
-                if _on_play_end:
-                    _on_play_end()
+        except Exception as e:
+            print(f"[播报异常] {e}")
         finally:
+            # 解除屏蔽必须放在 finally 里。
+            # _on_play_start() 把语音监听静音了，而解除屏蔽原本写在 try 里面 ——
+            # 一旦 PlaySound 抛异常（wav 被占用、声卡被独占等），这一行就永远
+            # 走不到，麦克风**永久静音**：应用看着还在跑、摄像头还在扫，
+            # 但语音指令再也不响应，而且不报任何错。这是个全语音操作的应用，
+            # 等于死机。
+            if muted and _on_play_end:
+                try:
+                    _on_play_end()
+                except Exception as e:
+                    print(f"[解除屏蔽失败] {e}")
             _speech_q.task_done()
             if done is not None:
                 done.set()

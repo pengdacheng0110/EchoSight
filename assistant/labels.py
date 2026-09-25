@@ -121,9 +121,36 @@ def height_trust(en):
 
 
 
+# ---------------- 匹配表 ----------------
+# 把"类别中文名（权威全集）"和"口语别名"合并成一张 表层词 -> 英文名 的表，
+# 匹配时按**最长的表层词优先**。
+#
+# 原先只查 ALIASES，有两个坑，第二个尤其致命：
+#   1) 漏收录 -> 直接匹配不到。停车计时器、冲浪板、滑雪板等 7 类叫不出来。
+#   2) **错配**：ALIASES 里有"球""包""刀""伞"这类极短的口语词，而
+#      "棒球棒""棒球手套"里都含"球"，"烤面包机"里含"包"。于是用户说
+#      "找棒球棒"会被匹配成 sports ball、说"找烤面包机"会被匹配成 handbag ——
+#      应用不会报错，它会**自信地去找一个完全不相干的东西**并播报"找到了"。
+#      对盲人用户来说这比"没听懂"危险得多。
+#
+# 并成一张表 + 长度降序后，"棒球棒"(3) 必然先于 "球"(1) 命中，两个问题一起解决。
+_MATCH_TABLE = {}
+for _en, _cn in CLASS_CN.items():
+    _MATCH_TABLE.setdefault(_cn, _en)      # 权威中文名优先
+for _cn, _en in ALIASES.items():
+    _MATCH_TABLE.setdefault(_cn, _en)      # 口语别名只补空缺，不覆盖权威名
+
+# skis 与 snowboard 的中文名都是"滑雪板"，会互相覆盖。补两个能区分的说法，
+# 让用户至少有一个途径精确指定；不区分时按 CLASS_CN 的顺序落到 skis。
+_MATCH_TABLE["双板滑雪板"] = "skis"
+_MATCH_TABLE["单板滑雪板"] = "snowboard"
+
+_MATCH_SURFACES = sorted(_MATCH_TABLE, key=len, reverse=True)
+
+
 def match_target(text):
-    """从一句话里按最长别名匹配目标，返回英文名；匹配不到返回 None。"""
-    for alias in sorted(ALIASES, key=len, reverse=True):
-        if alias in text:
-            return ALIASES[alias]
+    """从一句话里按最长的表层词匹配目标，返回英文名；匹配不到返回 None。"""
+    for surface in _MATCH_SURFACES:
+        if surface in text:
+            return _MATCH_TABLE[surface]
     return None

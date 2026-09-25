@@ -153,19 +153,41 @@ object Labels {
         data class Target(val classId: Int) : Command()
     }
 
-    /** 从一句话里按最长别名匹配，返回类别 id；匹配不到返回 null。 */
+    /**
+     * 匹配表：类别中文名（权威全集）+ 口语别名，合并成一张 表层词 -> 类别 id 的表，
+     * 匹配时按**最长的表层词优先**。
+     *
+     * 只查 [ALIASES] 有两个坑，第二个尤其致命：
+     *   1) 漏收录 —— 停车计时器、滑雪板、棒球棒、棒球手套、冲浪板叫不出来；
+     *   2) **错配** —— ALIASES 里有"球""包""刀""伞"这类极短的口语词，而
+     *      "棒球棒""棒球手套"里都含"球"、"烤面包机"里含"包"。于是用户说
+     *      "找棒球棒"会被匹配成 32(sports ball)、说"找烤面包机"会被匹配成
+     *      26(handbag) —— 应用不会报错，它会**自信地去找一个完全不相干的东西**
+     *      并播报"找到了"。对盲人用户来说这比"没听懂"危险得多。
+     *
+     * 注意：光加"兜底查询"救不了 —— 别名循环会先返回。必须合并成同一张表，
+     * 再按长度降序，"棒球棒"(3) 才能先于 "球"(1) 命中。
+     */
+    private val MATCH_TABLE: Map<String, Int> by lazy {
+        val m = HashMap<String, Int>()
+        CLASS_CN.forEachIndexed { id, cn -> if (cn.isNotEmpty()) m.putIfAbsent(cn, id) }
+        ALIASES.forEach { (alias, id) -> m.putIfAbsent(alias, id) }
+        // 30(skis) 与 31(snowboard) 的中文名都是"滑雪板"，补两个能区分的说法
+        m["双板滑雪板"] = 30
+        m["单板滑雪板"] = 31
+        m
+    }
+
+    private val MATCH_SURFACES: List<String> by lazy {
+        MATCH_TABLE.keys.sortedByDescending { it.length }
+    }
+
+    /** 从一句话里按最长的表层词匹配，返回类别 id；匹配不到返回 null。 */
     fun matchTarget(text: String): Int? {
-        for (alias in ALIASES.keys.sortedByDescending { it.length }) {
-            if (text.contains(alias)) return ALIASES[alias]
+        for (surface in MATCH_SURFACES) {
+            if (text.contains(surface)) return MATCH_TABLE[surface]
         }
-        // 兜底：直接按类别中文名匹配。
-        // ALIASES 是手工维护的口语表，漏了 6 个类别 —— 停车计时器(12)、
-        // 滑雪板(30/31)、棒球棒(34)、棒球手套(35)、冲浪板(37)。漏了就意味着
-        // 用户说"找冲浪板"会被当成没听懂，而目标物品只能靠语音指定，
-        // 这 6 类等于在这个应用里根本不存在。用 CLASS_CN 兜底后 80 类全覆盖，
-        // 以后新增别名也不会再出现这种"能看见、叫不出来"的类别。
-        val idx = CLASS_CN.indexOfFirst { it.isNotEmpty() && text.contains(it) }
-        return if (idx >= 0) idx else null
+        return null
     }
 
     /** 解析 ASR 文本，返回 Found / Target / null。 */

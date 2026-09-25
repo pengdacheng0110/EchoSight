@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from assistant import config                                    # noqa: E402
 from assistant.geometry import DistanceEstimator                # noqa: E402
-from assistant.labels import CLASS_CN, REAL_HEIGHT, TRUSTED_HEIGHT  # noqa: E402
+from assistant.labels import (CLASS_CN, REAL_HEIGHT, TRUSTED_HEIGHT,  # noqa: E402
+                              match_target)
 
 PASS, FAIL = [], []
 
@@ -139,6 +140,27 @@ check("可信类别非空且不过半", 0 < len(TRUSTED_HEIGHT) < 40,
       f"{len(TRUSTED_HEIGHT)} 类")
 bad = [k for k, v in REAL_HEIGHT.items() if not (0.01 <= v <= 6.0)]
 check("高度取值都在合理区间", not bad, f"异常 {bad}")
+
+print("\n[10] 目标名匹配：每个类别都要叫得出来，且不能叫错")
+# 目标物品只能靠语音指定，所以"能不能匹配到"和"会不会匹配错"都是硬指标。
+# 错配（说 A 返回 B）比匹配不到更危险 —— 应用会自信地去找另一个东西。
+# 实测过的真实缺陷：说"棒球棒"返回 sports ball（因为别名里有"球"），
+# 说"烤面包机"返回 handbag（因为别名里有"包"）。
+AMBIGUOUS = {"skis", "snowboard"}      # 中文名同为"滑雪板"，属固有歧义
+unreachable, mismatched = [], []
+for en, cn in CLASS_CN.items():
+    got = match_target(f"帮我找{cn}")
+    if got is None:
+        unreachable.append(cn)
+    elif got != en and en not in AMBIGUOUS:
+        mismatched.append(f"{cn}→{got}")
+check("每个类别都能被中文名匹配到", not unreachable, f"叫不出来 {unreachable}")
+check("没有把 A 匹配成 B", not mismatched, f"错配 {mismatched}")
+check("歧义的滑雪板可用限定词区分",
+      match_target("双板滑雪板") == "skis"
+      and match_target("单板滑雪板") == "snowboard")
+check("无关话语不会误触发",
+      match_target("今天天气不错") is None and match_target("") is None)
 
 print("\n" + "=" * 56)
 print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
