@@ -44,4 +44,9 @@
     <!-- 说话按钮 -->
     <color name="mic_button">#FF1565C0</color>
     <color name="mic_button_recording">#FFD32F2F</color>
+    <!--
+      按钮描边。按钮压在相机预览上，背景可能是任何颜色；
+      单靠填充色在浅色画面上（白墙、雪地）边界会糊掉，加一圈浅色描边拉开对比。
+    -->
+    <color name="mic_button_stroke">#66FFFFFF</color>
 </resources>

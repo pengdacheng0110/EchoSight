@@ -11,22 +11,28 @@
 
     <!-- 状态副标题 -->
     <string name="sub_no_target">尚未选择目标物品</string>
-    <string name="sub_searching">正在搜索 · 按住按钮可更换目标</string>
-    <string name="sub_standby">按住按钮说：找某某</string>
+    <string name="sub_searching">正在搜索 · 点一下按钮可更换目标</string>
+    <string name="sub_standby">点一下按钮说：找某某</string>
     <string name="sub_target">当前目标：%1$s</string>
     <string name="sub_recognizing">正在把你的话转成文字</string>
     <string name="sub_distance">距离 %1$s 米 · %2$s</string>
     <string name="sub_no_key">配置 SENSEAUDIO_API_KEY 后重新打包</string>
     <string name="sub_frame_error">画面已暂时清空，避免显示失效的位置</string>
+    <string name="sub_no_speech">没有听到声音，请再点一下按钮</string>
+    <string name="sub_exit_confirm">说「确认退出」或「取消」</string>
 
     <!-- 目标框标注 -->
     <string name="box_label">%1$s %2$s %3$s米</string>
     <string name="box_label_no_dist">%1$s %2$s</string>
 
-    <!-- 按住说话按钮 -->
-    <string name="btn_talk">按住\n说话</string>
-    <string name="btn_talk_listening">松开\n识别</string>
-    <string name="btn_talk_desc">按住说话，松手识别</string>
+    <!--
+      主按钮文案。
+      不再是"按住说话"：现在点一下开始、说完静音一会儿自动结束，
+      所以按钮上不该出现"按住"两个字 —— 写着不存在的操作方式比不写更糟。
+    -->
+    <string name="btn_talk">点一下说话</string>
+    <string name="btn_talk_listening">正在听…</string>
+    <string name="btn_talk_desc">点一下开始说话，再点一下表示说完了</string>
 
     <!-- 测距来源 -->
     <string name="source_fused">双模型融合</string>

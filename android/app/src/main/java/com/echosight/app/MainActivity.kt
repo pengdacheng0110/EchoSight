@@ -4,10 +4,12 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.PlaybackParams
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.view.HapticFeedbackConstants
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
@@ -31,11 +33,13 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.color.DynamicColors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import android.util.Log
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
 
@@ -49,26 +53,86 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bearing: BearingView
     private lateinit var pushButton: MaterialButton
 
-    private lateinit var detector: YoloDetector
-    private val api = VoiceApi(BuildConfig.SENSEAUDIO_KEY)
-    private val ptt = PushToTalk()
-
-    /** 本次按下是否真的进入了录音态。麦克风被占用时 start() 会失败。 */
-    private var pttActive = false
-    private val ttsExecutor = Executors.newSingleThreadExecutor()
-    private val analysisExecutor = Executors.newSingleThreadExecutor()
-
     /**
      * 连续处理失败多少帧。
      * 只在 analysisExecutor 这一个线程上读写，不需要 @Volatile。
      */
     private var frameErrorStreak = 0
 
+    /**
+     * 当前检测器。
+     *
+     * 允许为空：模型是异步加载的（建会话要读 assets + 初始化 ONNX，约 1 秒），
+     * 相机可能先出帧。加载完之前 [processFrame] 直接返回，什么都不画 ——
+     * 比画一堆旧框安全。
+     *
+     * 换模型时只在 [analysisExecutor] 上改这个引用（见 [applyModel]），
+     * @Volatile 是给 onDestroy 那条主线程路径读的。
+     */
+    @Volatile private var detector: YoloDetector? = null
+
+    /** 当前使用的检测模型。类别 id 是模型内局部的，所有 id → 名字都走它。 */
+    @Volatile private var activeModel: ModelSpec = Models.DEFAULT
+
+    private val api = VoiceApi(BuildConfig.SENSEAUDIO_KEY)
+    private val capture = VoiceCapture()
+
+    private val ttsExecutor = Executors.newSingleThreadExecutor()
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
+
+    /**
+     * 建模型会话用的线程池。
+     *
+     * 单独一个而不是复用 analysisExecutor：建会话要一秒左右，
+     * 排在分析线程上会把相机帧全堵住（画面直接卡住）。
+     */
+    private val modelExecutor = Executors.newSingleThreadExecutor()
+
+    /** 提示音。ToneGenerator 在个别设备上构造会失败，所以整段包 runCatching。 */
+    private var tone: ToneGenerator? = null
+
+    // ---------------- 播报状态 ----------------
+
+    /**
+     * 静音中（语音指令"安静"）。
+     *
+     * 与"待命"（[standby]）不同：待命是不再提示目标位置，静音是不再出声，
+     * 但扫描和界面刷新照旧。两个状态互相独立。
+     */
+    @Volatile private var muted = false
+
+    /** 最近一次播报的原文，"再说一遍"直接重播它。 */
+    @Volatile private var lastSpokenText: String? = null
+
+    /** 播报音量档位 0~2（对应 [VOLUME_LEVELS]），"大点声/小点声"会改。 */
+    @Volatile private var volumeLevel = 2
+
+    /** 语速档位 0~2（对应 [SPEED_LEVELS]），"说慢点/说快点"会改。 */
+    @Volatile private var speedLevel = 1
+
+    /**
+     * 最近一帧的全部检测框，"看看周围有什么"用它。
+     *
+     * 分析线程写、主线程读，所以 @Volatile。存的是不可变列表，读的时候不会变。
+     */
+    @Volatile private var lastFrameBoxes: List<DetBox> = emptyList()
+
+    // ---------------- 退出确认 ----------------
+
+    /**
+     * 正在等用户确认退出。
+     *
+     * 退出不可撤销，所以必须二次确认；同时这个状态**有时限** ——
+     * 不然用户过一会儿随口说句带"确认"的话就会被退出。
+     */
+    @Volatile private var awaitingExit = false
+    @Volatile private var exitAskedAt = 0L
+
     // ---------------- 目标状态 ----------------
     //
     // 下面这几个字段**两个线程都会写**：
     //   * 分析线程 —— processFrame() 每帧更新"上次看到/上次播报"的时间戳；
-    //   * 主线程   —— switchTarget() 在切目标时把它们重置（走 lifecycleScope，
+    //   * 主线程   —— setTarget() 在切目标时把它们重置（走 lifecycleScope，
     //                 默认 Dispatchers.Main）。
     // 所以全部标 @Volatile。原先只有 targetId / standby / lastSeenHit 标了，
     // 这几个漏了 —— 漏掉不会崩，但主线程写进去的"刚刚重置过"分析线程可能看不见，
@@ -178,12 +242,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startEverything() {
-        detector = YoloDetector(this)
+        // 模型异步加载：建会话要读 assets 再初始化 ONNX（约 1 秒），放主线程会把
+        // 启动卡住。加载完之前 processFrame 直接返回，什么都不画。
+        applyModel(Models.DEFAULT)
+
         tilt = CameraTilt(this)
         tilt.start()
+        capture.onResult = ::onCaptureResult
         bindCamera()
-        bindPushButton()
-        speak("回声视见已启动。请问你要寻找什么物品？请按住屏幕下方的大按钮，对着手机说话，说完松手。")
+        bindButton()
+        speak("回声视见已启动。请问你要寻找什么物品？" +
+            "点一下屏幕下方的大按钮就可以说话，说完我会自己停下来。" +
+            "想让我做什么直接说就行，比如，找杯子，看看周围，或者，帮助。")
     }
 
     // ---------------- 相机 ----------------
@@ -256,26 +326,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processFrame(image: ImageProxy) {
-        val boxes = detector.detect(image)
-        overlay.frameWidth = detector.frameWidth
-        overlay.frameHeight = detector.frameHeight
+        // 模型还没加载好（启动后约 1 秒内，或正在换模型）。什么都不画，
+        // 而不是拿上一次的结果接着画 —— 那是"看起来一切正常的错数据"。
+        val det = detector ?: return
+        val boxes = det.detect(image)
+        lastFrameBoxes = boxes
+        overlay.frameWidth = det.frameWidth
+        overlay.frameHeight = det.frameHeight
 
         val tid = targetId
         val now = System.currentTimeMillis()
 
         if (tid == null) {
             overlay.drawBoxes = emptyList()
-            frameHud("等待指令：按住下方大按钮说话",
+            frameHud("等待指令：点一下下方大按钮说话",
                 getString(R.string.sub_no_target), UiState.IDLE)
             return
         }
-        val frameW = detector.frameWidth.toFloat()
-        val frameH = detector.frameHeight.toFloat()
+        val frameW = det.frameWidth.toFloat()
+        val frameH = det.frameHeight.toFloat()
 
         val hits = boxes.filter { it.cls == tid }.map {
             Guidance.buildHit(it, frameW, frameH, tid, tilt.depressionDeg)
         }
-        val cn = Labels.CLASS_CN[tid]
+        val cn = activeModel.nameOf(tid)
 
         // 待机：只画不播
         if (standby) {
@@ -340,46 +414,69 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------------- 按住说话 ----------------
-    private fun bindPushButton() {
-        pushButton.setOnTouchListener { v: View, event: MotionEvent ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                    stopSpeaking()
-                    pttActive = ptt.start()
-                    if (pttActive) {
-                        setRecordingUi(true)
-                    } else {
-                        // 麦克风被占用时 start() 会失败（不再抛异常打崩应用），
-                        // 这里把原因说出来，别让用户对着一个没反应的按钮干按。
-                        updateHud(getString(R.string.status_mic_busy),
-                            getString(R.string.sub_searching), UiState.ERROR,
-                            holdMs = 3000L)
-                        speak(getString(R.string.status_mic_busy))
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                    val wasActive = pttActive
-                    pttActive = false
-                    val wav = ptt.stop()
-                    // 只有真的进过录音态才动 UI：否则会把上面那条错误提示
-                    // 的占位时间一起清掉（setRecordingUi(false) 会重置 hudHoldUntil）
-                    if (wasActive) setRecordingUi(false)
-                    if (event.action == MotionEvent.ACTION_UP && wasActive && wav.size > 1000) {
-                        sendForAsr(wav)
-                    } else if (event.action == MotionEvent.ACTION_UP && wasActive) {
-                        updateHud("说话时间太短了，请按住按钮多说一会儿。",
-                            getString(R.string.sub_searching), UiState.SEARCHING,
-                            holdMs = 2500L)
-                        speak("说话时间太短了，请按住按钮多说一会儿。")
-                    }
-                    true
-                }
-                else -> false
+    // ---------------- 点一下说话 ----------------
+
+    /**
+     * 主按钮：点一下开始录音，再点一下表示"我说完了"。
+     *
+     * 原先必须按住不放。对盲人用户，"摸到按钮并一直按住"恰恰是整套交互里最难的一步：
+     * 看不见按钮在哪、按着不能松、松早了话没说完、手一抖滑出按钮还会被当成取消。
+     * 现在点一下就行，而且**说完不用管它** —— 静音一会儿会自动结束
+     * （见 [VoiceCapture]），所以连"再点一下"都不是必须的。
+     */
+    private fun bindButton() {
+        pushButton.setOnClickListener {
+            if (voiceDisabled) return@setOnClickListener
+            if (capture.isRecording) {
+                // 再点一下 = 我说完了。手动结束也走同一个回调，不会重复识别。
+                pushButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                capture.requestStop()
+                setRecordingUi(false)
+            } else {
+                startListening()
             }
+        }
+    }
+
+    private fun startListening() {
+        // 先停掉正在播的语音，否则会被自己的喇叭录进去
+        stopSpeaking()
+        if (!capture.start()) {
+            // 麦克风被占用时 start() 会返回 false（不再抛异常打崩应用），
+            // 这里把原因说出来，别让用户对着一个没反应的按钮干按。
+            updateHud(getString(R.string.status_mic_busy),
+                getString(R.string.sub_searching), UiState.ERROR, holdMs = 3000L)
+            speak(getString(R.string.status_mic_busy))
+            return
+        }
+        // 开始录音给一个短振动 + 一声提示音。看不见界面的时候，
+        // "它到底开始听了没有"只能靠这两个反馈来确认。
+        pushButton.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        beep(TONE_START)
+        setRecordingUi(true)
+    }
+
+    /**
+     * 录音结果。**在录音线程上被调用，不是主线程** ——
+     * 里面所有碰界面的动作都经过 updateHud / runOnUiThread。
+     */
+    private fun onCaptureResult(wav: ByteArray, reason: VoiceCapture.StopReason) {
+        // 先解除录音态。顺序不能反：setRecordingUi(false) 会清掉 hudHoldUntil，
+        // 排在后面的话会把下面刚设好的占位时间一起清掉，提示一闪就没。
+        setRecordingUi(false)
+
+        when {
+            reason == VoiceCapture.StopReason.AUTO_NO_SPEECH -> {
+                // 空白音频不要发去识别：白花一次请求，用户还得多等几秒才知道没听清。
+                updateHud("没有听到声音，请再点一下按钮说话。",
+                    getString(R.string.sub_no_speech), UiState.SEARCHING, holdMs = 2500L)
+            }
+            wav.size < MIN_WAV_BYTES -> {
+                updateHud("说话时间太短了，请点一下按钮多说一会儿。",
+                    getString(R.string.sub_searching), UiState.SEARCHING, holdMs = 2500L)
+                speak("说话时间太短了，请点一下按钮多说一会儿。")
+            }
+            else -> sendForAsr(wav)
         }
     }
 
@@ -393,13 +490,14 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.getColor(this,
                 if (recording) R.color.mic_button_recording else R.color.mic_button))
         if (recording) {
-            // 录音期间靠 frameHud 的 ptt.isRecording 判断跳过刷新，这里的占位只是兜底
+            // 录音期间靠 frameHud 里对 capture.isRecording 的判断跳过刷新，
+            // 这里的占位只是兜底。占位时长要盖得住自动结束的最长等待：
+            // VoiceCapture 的硬上限是 20 秒，取 25 秒。
             updateHud("正在聆听，请说话", getString(R.string.sub_recognizing),
-                UiState.LISTENING, holdMs = 30_000L)
+                UiState.LISTENING, holdMs = 25_000L)
         } else {
-            // 松手必须解除占位：ACTION_CANCEL（手指滑出按钮、手势被父容器抢走）时
-            // 下面两个分支都不会走，30 秒的占位会把状态卡片冻在"正在聆听"不动。
-            // 紧接着 sendForAsr 或"说话太短"分支会设它们自己的占位时间。
+            // 解除占位。onCaptureResult 紧接着会设它自己的占位时间，
+            // 所以这里必须先清零，否则"没有听到声音"之类的提示会被这段占位挡住。
             hudHoldUntil = 0L
         }
     }
@@ -409,29 +507,322 @@ class MainActivity : AppCompatActivity() {
             UiState.SEARCHING, holdMs = 2500L)
         lifecycleScope.launch {
             val text = withContext(Dispatchers.IO) { api.transcribe(wav) }
-            when (val cmd = Labels.parseCommand(text)) {
-                is Labels.Command.Target -> switchTarget(cmd.classId)
-                Labels.Command.Found -> {
-                    standby = true
-                    speak("好的，我先安静待命。需要找别的东西时，按住按钮说，找，加上物品名字。")
+
+            // 退出确认态有时限：先说"我要退出"、过很久再随口说句带"确认"的话，
+            // 不该把应用退掉。这里每次识别前先检查一次。
+            if (awaitingExit && System.currentTimeMillis() - exitAskedAt > EXIT_CONFIRM_MS) {
+                awaitingExit = false
+            }
+
+            val cmd = Labels.parseCommand(text, awaitingExit)
+            if (cmd == null) {
+                when {
+                    // 确认态下听不懂就再问一次，绝不猜 —— 退出不可撤销。
+                    awaitingExit ->
+                        speak("我没有听清。要退出请说，确认退出；不退出请说，取消。")
+                    text.isBlank() ->
+                        speak("没有听清，请点一下按钮，靠近手机再说一次。")
+                    else ->
+                        speak("没有听懂“$text”。你可以说，找杯子，看看周围，或者，帮助。")
                 }
-                null -> {
-                    if (text.isBlank()) speak("没有听清，请按住按钮，靠近手机再说一次。")
-                    else speak("没有听懂“$text”。请按住按钮说，找，加上物品名字，比如找杯子。")
+                return@launch
+            }
+            handleCommand(cmd)
+        }
+    }
+
+    /**
+     * 执行一条语音指令。
+     *
+     * `when` 覆盖全部 [Labels.Command] 分支，而且**故意不写 else** ——
+     * 以后往词表里加指令时，编译器会在这里直接报错，逼着人来接上行为。
+     * 写个 else 兜住的话，就会出现"词表加了、但说了没反应"的静默失效，
+     * 而那种问题不编译、不报错、也没日志，只能靠用户发现。
+     */
+    private fun handleCommand(cmd: Labels.Command) {
+        when (cmd) {
+            is Labels.Command.Target -> switchTarget(cmd.ref)
+
+            Labels.Command.Found -> {
+                standby = true
+                speak("好的，我先安静待命。需要找别的东西时，点一下按钮说，找，加上物品名字。")
+            }
+
+            Labels.Command.Resume -> {
+                val cn = targetId?.let { activeModel.nameOf(it) }
+                if (cn == null) {
+                    speak("请先告诉我要找什么，比如说，找杯子。")
+                } else {
+                    standby = false
+                    val now = System.currentTimeMillis()
+                    searchStart = now
+                    lastLosePrompt = now
+                    lastFoundReport = now
+                    lastSpokenDist = null
+                    speak("好，继续帮你找$cn。")
+                }
+            }
+
+            Labels.Command.Repeat -> repeatLastReport()
+
+            Labels.Command.Mute -> {
+                // 先播确认、再置标志。speak() 的静音检查是同步做的，
+                // 顺序反了这句确认就永远出不来。
+                speak("好的，我先不说话。要我再开口，就说，可以说了。")
+                muted = true
+            }
+
+            Labels.Command.Unmute -> {
+                muted = false
+                speak("好，我继续说话。")
+            }
+
+            Labels.Command.Describe -> describeSurroundings()
+
+            Labels.Command.Help -> speak(HELP_TEXT)
+
+            Labels.Command.Louder -> {
+                if (volumeLevel >= VOLUME_LEVELS.lastIndex) {
+                    speak("已经是最响了，还想更大请按手机侧面的音量键。")
+                } else {
+                    volumeLevel++
+                    speak("好，声音调大一点。")
+                }
+            }
+
+            Labels.Command.Quieter -> {
+                if (volumeLevel <= 0) {
+                    speak("已经是最轻了。")
+                } else {
+                    volumeLevel--
+                    speak("好，声音调小一点。")
+                }
+            }
+
+            Labels.Command.Slower -> {
+                if (speedLevel <= 0) {
+                    speak("已经是最慢了。")
+                } else {
+                    speedLevel--
+                    speak("好，我说慢一点。")
+                }
+            }
+
+            Labels.Command.Faster -> {
+                if (speedLevel >= SPEED_LEVELS.lastIndex) {
+                    speak("已经是最快了。")
+                } else {
+                    speedLevel++
+                    speak("好，我说快一点。")
+                }
+            }
+
+            is Labels.Command.SwitchModel -> requestModelSwitch(cmd.modelId)
+
+            Labels.Command.Exit -> askExit()
+
+            Labels.Command.Confirm -> {
+                awaitingExit = false
+                speakThenExit("好的，再见。")
+            }
+
+            Labels.Command.Cancel -> {
+                awaitingExit = false
+                speak("好，不退出。")
+            }
+        }
+    }
+
+    /**
+     * 语音切换模型。
+     *
+     * 三种情况都要**说出来**：已经就是这个模型、没装进来、正在换。
+     * 静默什么都不做是最糟的结果 —— 用户不知道要不要再试一次。
+     */
+    private fun requestModelSwitch(modelId: String) {
+        val spec = Models.byId(modelId)
+        if (spec == null) {
+            speak("没有这个模型。")
+            return
+        }
+        if (spec.id == activeModel.id) {
+            speak("现在用的就是${spec.displayName}。")
+            return
+        }
+        applyModel(spec)
+    }
+
+    /**
+     * 换用另一个检测模型。
+     *
+     * 分两步，为的是不阻塞任何一条关键路径：
+     *   1. 在 [modelExecutor] 上建会话（读 assets + 初始化 ONNX，约 1 秒）；
+     *   2. 建好之后，把"换引用 + 关旧会话"丢到 [analysisExecutor] 上做。
+     *
+     * 第 2 步**必须**落在分析线程上：那条线程独占 [detector]，在它上面换引用就
+     * 不可能有帧正在用旧的 detector。反过来，若在主线程直接关旧会话，而恰好有
+     * 一帧卡在 session.run 里，那就是在释放正在使用的原生句柄 —— 直接崩。
+     * onDestroy 里关会话用的是同一个道理。
+     *
+     * @param announce 换成功后是否播报一句。启动时首次加载不需要（启动语已覆盖）。
+     * @param then     换好之后在主线程上执行（比如接着设置目标）。
+     *                 **失败时不会调用** —— 模型没换成还去设目标，
+     *                 用户会以为"它听懂了但找不到"，而真实原因是没有那个模型。
+     */
+    private fun applyModel(
+        spec: ModelSpec,
+        announce: Boolean = true,
+        then: (() -> Unit)? = null,
+    ) {
+        if (!Models.isAvailable(this, spec)) {
+            Log.w(TAG, "模型 ${spec.id} 不可用：assets/${spec.assetName} 不存在，或类别表为空")
+            speak("${spec.displayName}还没有装进来，我继续用${activeModel.displayName}。")
+            return
+        }
+        modelExecutor.execute {
+            val built = runCatching { YoloDetector(this, spec) }.getOrNull()
+            // 包一层 runCatching：onDestroy 会关掉 analysisExecutor，
+            // 若这次投递正好落在关闭之后，会被拒绝并抛 RejectedExecutionException ——
+            // 那是在线程池线程上抛的，没人接就是一次闪退。
+            runCatching {
+                analysisExecutor.execute {
+                    if (built == null) {
+                        Log.e(TAG, "模型 ${spec.id} 加载失败")
+                        speak("${spec.displayName}加载失败，我继续用${activeModel.displayName}。")
+                        return@execute
+                    }
+                    val old = detector
+                    detector = built
+                    activeModel = spec
+                    // 旧会话是原生内存（模型本体 + 运行时缓冲，约 10MB），不关就永远漏着，
+                    // 每换一次漏一份。
+                    old?.runCatching { close() }
+                    Models.warnMissingHeights(spec)
+                    runOnUiThread {
+                        // 类别 id 是模型内局部的，换模型后旧目标 id 不再有意义。
+                        // 不清掉的话会拿大模型的 3 号（摩托车）去小模型里查，
+                        // 然后自信地播报一个完全不相干的物品名。
+                        targetId = null
+                        standby = false
+                        lastSeenHit = null
+                        lastSpokenDist = null
+                        lastSeenTime = 0L
+                        tracker.reset()
+                        then?.invoke()
+                        if (announce) speak("好，现在用${spec.displayName}。")
+                    }
                 }
             }
         }
     }
 
-    /** 完整的目标切换处理。 */
-    private fun switchTarget(newId: Int) {
-        val cn = Labels.CLASS_CN[newId]
+    /**
+     * 看看周围：把画面里当前看到的物体一次说出来。
+     *
+     * 用最近一帧的结果（[lastFrameBoxes]）而不是重新推理一次 —— 重新跑要几百毫秒，
+     * 而用户问的是"现在有什么"，最近一帧最多也就 33ms 前，足够了。
+     */
+    private fun describeSurroundings() {
+        val boxes = lastFrameBoxes
+        if (boxes.isEmpty()) {
+            speak("我现在没有看到认识的东西。可以慢慢转动身体，再问我一次。")
+            return
+        }
+        // 按类别归并计数；同类里取最大框的面积参与排序（框大通常意味着更近）
+        val grouped = boxes.groupBy { it.cls }
+            .map { (cls, list) ->
+                Triple(cls, list.size,
+                    list.maxOf { (it.x2 - it.x1) * (it.y2 - it.y1) })
+            }
+            .sortedByDescending { it.third }
+        val parts = grouped.take(MAX_DESCRIBE_CLASSES).map { (cls, n, _) ->
+            val name = activeModel.nameOf(cls)
+            if (n > 1) "${name}${n}个" else name
+        }
+        val more = if (grouped.size > MAX_DESCRIBE_CLASSES) "，还有别的东西" else ""
+        speak("我看到${parts.joinToString("、")}$more。")
+    }
+
+    /** 再说一遍：把最近一次播报原样重播。 */
+    private fun repeatLastReport() {
+        val last = lastSpokenText
+        if (last == null) speak("我还没说过什么。先告诉我你要找什么，比如说，找杯子。")
+        else speak(last)
+    }
+
+    /** 退出前的二次确认。退出不可撤销，所以必须问一次。 */
+    private fun askExit() {
+        awaitingExit = true
+        exitAskedAt = System.currentTimeMillis()
+        updateHud("要退出吗？", getString(R.string.sub_exit_confirm),
+            UiState.ERROR, holdMs = EXIT_CONFIRM_MS)
+        speak("确定要退出吗？要退出请说，确认退出；不退出请说，取消。")
+    }
+
+    /**
+     * 播完最后一句再退出。
+     *
+     * 不能用固定延时糊弄：TTS 是网络请求，慢的时候一两秒才返回 ——
+     * 延时短了话被切断，延时长了界面卡在那里。
+     *
+     * 所以走 [speak] 的完成回调，**并且必须带超时兜底**：网络挂了、播放器出错时
+     * 回调永远不会来，那就永远退不出去了 —— 对盲人用户意味着"说退出没反应"。
+     */
+    private fun speakThenExit(text: String) {
+        // 静音状态下不留遗言，直接退（用户明确要求过别说话）
+        if (muted || voiceDisabled) {
+            finish()
+            return
+        }
+        val done = AtomicBoolean(false)
+        val go = { if (done.compareAndSet(false, true)) finish() }
+        speak(text, onDone = go)
+        lifecycleScope.launch {
+            delay(EXIT_SPEAK_TIMEOUT_MS)
+            go()
+        }
+    }
+
+    /** 提示音。ToneGenerator 在个别设备上构造会失败，整段包住，失败就算了。 */
+    private fun beep(type: Int) {
+        runCatching {
+            val t = tone ?: ToneGenerator(AudioManager.STREAM_MUSIC, BEEP_VOLUME)
+                .also { tone = it }
+            t.startTone(type, BEEP_MS)
+        }
+    }
+
+    /**
+     * 切换目标。
+     *
+     * [ref] 带模型标识：用户说的物品可能根本不在当前模型里
+     * （比如"钥匙"将来只在小模型里）。那种情况下先把模型换过去，再设目标，
+     * 而不是拿一个当前模型里毫无意义的类别 id 去搜。
+     */
+    private fun switchTarget(ref: TargetRef) {
+        if (ref.modelId == activeModel.id) {
+            setTarget(ref.classId)
+            return
+        }
+        val spec = Models.byId(ref.modelId)
+        if (spec == null) {
+            speak("我还认不出这个物品。")
+            return
+        }
+        // 不播"正在换模型"这种过渡话术：它会被紧接着的目标播报打断，
+        // 用户只会听到后半句。换模型的事实由 setTarget 的播报带出来。
+        applyModel(spec, announce = false) { setTarget(ref.classId) }
+    }
+
+    /** 真正设置目标并播报。 */
+    private fun setTarget(classId: Int) {
+        val cn = activeModel.nameOf(classId)
         val now = System.currentTimeMillis()
-        if (newId == targetId && !standby) {
+        if (classId == targetId && !standby) {
             speak("已经在帮你找$cn 了。")
             return
         }
-        targetId = newId
+        targetId = classId
         standby = false
         searchStart = now
         lastLosePrompt = now
@@ -442,7 +833,11 @@ class MainActivity : AppCompatActivity() {
         tracker.reset()
         updateHud(getString(R.string.sub_target, cn), getString(R.string.sub_searching),
             UiState.SEARCHING, holdMs = 2500L)
-        speak("好的，现在帮你寻找$cn。请把手机摄像头对准前方，慢慢转动身体，我会告诉你它在哪里。")
+        // 不是默认模型时把模型名带出来 —— 用户刚说了"换小模型"，
+        // 需要一句确认让他知道确实换过去了。
+        val via = if (activeModel.id == Models.DEFAULT.id) "" else "用${activeModel.displayName}"
+        speak("好的，现在${via}帮你寻找$cn。" +
+            "请把手机摄像头对准前方，慢慢转动身体，我会告诉你它在哪里。")
     }
 
     // ---------------- 语音播放 ----------------
@@ -494,13 +889,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun speak(text: String) {
-        if (voiceDisabled || ttsStopped) return
+    /**
+     * 播报。
+     *
+     * @param onDone 播完之后的回调，**主线程**。注意播放被打断时不会触发
+     *               （[releaseCurrentPlayer] 走的是 stop + release，不触发 onCompletion），
+     *               所以调用方必须自己带超时兜底 —— 见 [speakThenExit]。
+     */
+    private fun speak(text: String, onDone: (() -> Unit)? = null) {
+        // 静音检查放在调用方线程上同步判断，而不是丢进线程池里再判：
+        // "安静"这条指令需要"先播确认、再置标志"，顺序反过来那句确认就出不来了。
+        if (voiceDisabled || ttsStopped || muted) return
+        lastSpokenText = text
+        val vol = VOLUME_LEVELS[volumeLevel]
+        val speed = SPEED_LEVELS[speedLevel]
         ttsExecutor.execute {
             val wav = api.synthesize(text) ?: return@execute
             // synthesize() 是阻塞的网络请求，shutdownNow() 打断不了它，
             // 所以拿到结果之后必须再看一眼是否已经进入销毁流程。
-            if (ptt.isRecording || ttsStopped) return@execute
+            if (capture.isRecording || ttsStopped) return@execute
             try {
                 releaseCurrentPlayer()
                 val file = File(cacheDir, "tts_${ttsCounter++}.wav")
@@ -525,15 +932,50 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
                         }
+                        // 完成回调留在主线程（MediaPlayer 的回调本来就在主线程）。
+                        // 播放被打断时这里不会走到，所以调用方必须自己兜超时。
+                        if (onDone != null) runCatching { onDone() }
                     }
                     prepare()
                 }
                 currentPlayer = player
                 currentTtsFile = file
+                applyVolume(player, vol)
+                applySpeed(player, speed)
                 player.start()
             } catch (e: Exception) {
                 // 播放失败不影响主流程
             }
+        }
+    }
+
+    /**
+     * 音量。
+     *
+     * 用播放器自己的音量，而不是改 TTS 请求里的 `vol` 参数 —— 后者要猜接口
+     * 接受什么范围，猜错会让整条合成请求失败，那就成了"彻底不出声"，
+     * 比"声音大小没变"严重得多。播放器音量是本地行为，出错也只是没效果。
+     *
+     * 上限 1.0 就是设备当前音量，想再大只能按硬件音量键 ——
+     * 所以"大点声"到顶时会明确让用户去按音量键，而不是假装调过了。
+     */
+    private fun applyVolume(player: MediaPlayer, vol: Float) {
+        runCatching { player.setVolume(vol, vol) }
+    }
+
+    /**
+     * 语速。
+     *
+     * `playbackParams` 在个别设备/音频通道上不被支持会抛异常，失败就保持原速 ——
+     * 那是"没变快"而不是"听不到"，可以接受。
+     * 固定 `setPitch(1f)`：只变速不变调，否则会像快进磁带。
+     */
+    private fun applySpeed(player: MediaPlayer, speed: Float) {
+        if (speed == 1f) return
+        runCatching {
+            player.playbackParams = PlaybackParams()
+                .setSpeed(speed)
+                .setPitch(1f)
         }
     }
 
@@ -617,7 +1059,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         // 没配 Key 时状态卡片常驻错误提示，不被检测帧冲掉
         if (voiceDisabled) return
-        if (ptt.isRecording) return
+        if (capture.isRecording) return
         if (System.currentTimeMillis() < hudHoldUntil) return
         updateHud(text, sub, state, bearingAngle)
     }
@@ -632,7 +1074,7 @@ class MainActivity : AppCompatActivity() {
         // 兜底释放麦克风：销毁时若还占着 AudioRecord，别的应用会录不了音。
         // release() 是同步的，不像 stopSpeaking() 那样要排进线程池 ——
         // 下面紧跟着 shutdownNow()，排进去的任务会被直接丢弃，等于没写。
-        ptt.release()
+        capture.release()
 
         // 同一个道理，上面那句注释没管到的另一半：正在播放的 MediaPlayer 和它的
         // 临时 wav，原先只靠 stopSpeaking() 排进 ttsExecutor 去释放，而这里紧接着
@@ -642,14 +1084,20 @@ class MainActivity : AppCompatActivity() {
         ttsExecutor.shutdownNow()
         releaseCurrentPlayer()
 
+        // 提示音发生器也是原生资源，一起放掉
+        runCatching { tone?.release() }
+        tone = null
+
+        // 先关建模型的线程池：它内部会往 analysisExecutor 投任务，
+        // 后关 analysisExecutor 的话那次投递会被拒绝。
+        modelExecutor.shutdown()
+
         // ONNX 会话占的是原生内存（模型本体加运行时缓冲，约 10MB），GC 管不到，
         // 原先没有任何地方释放它 —— Activity 每次重建都会再建一个。
         // 关闭动作必须排在检测线程自己身上，不能在主线程直接关：万一还有一帧
         // 卡在 session.run 里，那就是在释放正在使用的原生句柄，会直接崩。
         // 这里用 shutdown() 而不是 shutdownNow()，后者会把关闭任务本身丢掉。
-        if (::detector.isInitialized) {
-            runCatching { analysisExecutor.execute { detector.close() } }
-        }
+        runCatching { analysisExecutor.execute { detector?.close() } }
         analysisExecutor.shutdown()
     }
 
@@ -657,5 +1105,49 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "EchoSight"
         private const val LOSE_PROMPT_INTERVAL = 7000L
         private const val FOUND_REPORT_INTERVAL = 5000L
+
+        /** 小于这个字节数的录音直接丢弃：多半是误触。 */
+        private const val MIN_WAV_BYTES = 1000
+
+        /** 退出确认的有效期。过期后说"确认"不会退出。 */
+        private const val EXIT_CONFIRM_MS = 8000L
+
+        /** 告别语最多等这么久，超时就直接退出（TTS 是网络请求，可能永远不返回）。 */
+        private const val EXIT_SPEAK_TIMEOUT_MS = 4000L
+
+        /** 描述周围时最多报几个类别，太多了听不完。 */
+        private const val MAX_DESCRIBE_CLASSES = 6
+
+        /** 提示音：开始用短哔，结束用确认音。 */
+        private const val TONE_START = ToneGenerator.TONE_PROP_BEEP
+        private const val BEEP_VOLUME = 80
+        private const val BEEP_MS = 120
+
+        /**
+         * 音量档位。1.0 是设备当前音量，不能超过 —— 想更大只能按硬件音量键。
+         * 所以"大点声"到顶时会明确让用户去按音量键。
+         */
+        private val VOLUME_LEVELS = floatArrayOf(0.35f, 0.6f, 1.0f)
+
+        /** 语速档位。1.0 为正常。 */
+        private val SPEED_LEVELS = floatArrayOf(0.75f, 1.0f, 1.3f)
+
+        /**
+         * "帮助"念出来的说明。
+         *
+         * 必须和 [Labels.parseCommand] 里真实支持的词对得上 —— 念了做不到的指令，
+         * 比不念更糟：用户会反复尝试一个不存在的功能。
+         */
+        private const val HELP_TEXT =
+            "你可以这样说。" +
+                "找东西，比如说，找杯子，找手机。" +
+                "不想找了，说，停下。" +
+                "继续找，说，继续找。" +
+                "想听周围有什么，说，看看周围。" +
+                "想让我重说一遍，说，再说一遍。" +
+                "想让我安静，说，安静；想让我开口，说，可以说了。" +
+                "声音大小说，大点声，小点声；快慢说，说慢点，说快点。" +
+                "换模型说，换小模型，或者，换大模型。" +
+                "要退出，说，退出。"
     }
 }

@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
+import android.util.Log
 import androidx.camera.core.ImageProxy
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
@@ -21,7 +22,14 @@ data class DetBox(
     val cls: Int, val conf: Float
 )
 
-class YoloDetector(context: Context) : AutoCloseable {
+/**
+ * ONNX 目标检测。
+ *
+ * 模型完全由 [ModelSpec] 参数化：assets 文件名、输入边长、类别数都取自它，
+ * 不再硬编码 COCO 的 80 类 / 320。以后加小模型只要在 [Models] 里登记一条
+ * [ModelSpec]，不用动这里的推理代码。
+ */
+class YoloDetector(context: Context, val spec: ModelSpec) : AutoCloseable {
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
@@ -32,7 +40,8 @@ class YoloDetector(context: Context) : AutoCloseable {
     }
     private val inputName: String
 
-    private val inputSize = 320
+    private val inputSize = spec.inputSize
+    private val classCount = spec.classCount
     private val confThreshold = 0.3f
     private val iouThreshold = 0.45f
 
@@ -46,15 +55,23 @@ class YoloDetector(context: Context) : AutoCloseable {
     private val letterboxCanvas = Canvas(letterboxBitmap)
     private val blackPaint = Paint().apply { color = Color.BLACK }
     private val tmpTransform = Matrix()
-    /** letterbox 后的像素，固定 320×320。 */
+    /** letterbox 后的像素，尺寸固定为 inputSize×inputSize。 */
     private val letterboxPixels = IntArray(inputSize * inputSize)
     /** YUV→ARGB 的中间数组，尺寸随帧变化，只在变化时重建。 */
     private var argbPixels = IntArray(0)
 
     init {
-        val bytes = context.assets.open("yolo26n.onnx").use { it.readBytes() }
+        // 类别表为空说明这条 ModelSpec 还没填完（小模型刚登记、类别表还是空的）。
+        // 放行的话 anchors 会按 classCount=0 算，输出解析整体错位，
+        // 框会画在完全无关的位置 —— 那比构造失败难查得多，所以直接挡在这里。
+        require(classCount > 0) {
+            "模型 ${spec.id} 的类别表是空的，无法推理（请在 Models 里填好 classNames）"
+        }
+        val bytes = context.assets.open(spec.assetName).use { it.readBytes() }
         session = env.createSession(bytes, opts)
         inputName = session.inputNames.first()
+        Log.i(TAG, "已加载模型 ${spec.id}（${spec.assetName}）：" +
+            "输入 $inputSize×$inputSize，类别 $classCount")
     }
 
     /**
@@ -157,12 +174,15 @@ class YoloDetector(context: Context) : AutoCloseable {
             val ot = output.get(0) as OnnxTensor
             outTensor = ot
             val fb = ot.floatBuffer
-            val anchors = fb.capacity() / 84      // 2100
+            // 输出布局 [1, 4 + 类别数, anchors]：前 4 个通道是 cx/cy/w/h，
+            // 后面每个类别一个通道。84 是 COCO 的 4+80，不能写死 ——
+            // 换成别的类别数（小模型）就会算错 anchors，框全乱。
+            val anchors = fb.capacity() / (4 + classCount)
             val raw = ArrayList<DetBox>()
             for (i in 0 until anchors) {
                 var bestScore = confThreshold
                 var bestCls = -1
-                for (c in 0 until 80) {
+                for (c in 0 until classCount) {
                     val s = fb.get(4 * anchors + c * anchors + i)
                     if (s > bestScore) {
                         bestScore = s
@@ -270,5 +290,9 @@ class YoloDetector(context: Context) : AutoCloseable {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         bitmap.setPixels(argb, 0, width, 0, 0, width, height)
         return bitmap
+    }
+
+    private companion object {
+        const val TAG = "YoloDetector"
     }
 }
